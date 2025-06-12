@@ -2,20 +2,20 @@
 import os
 import re
 import json
-import sys
+import shutil
 from docx import Document
 from docx.shared import RGBColor
 import xlsxwriter
+from tqdm import tqdm
 
 # === CONFIG ===
 INPUT_FILE   = "input.txt"
 OUTPUT_XLSX  = "ParsedLogs.xlsx"
 OUTPUT_DOCX  = "ParsedLogs.docx"
 
-# Your mobile regex
 MOBILE_REGEX = re.compile(r'(?<!\d)((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})(?!\d)')
 
-# === UTILITIES ===
+# === HELPERS ===
 def flatten_json(obj, prefix=""):
     flat = {}
     if isinstance(obj, dict):
@@ -31,7 +31,6 @@ def flatten_json(obj, prefix=""):
     return flat
 
 def detect_type(line):
-    # Type A: timestamp + " cid=[...] txn=[...]"
     if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', line):
         if ' cid=[' in line and ' txn=[' in line:
             return 'A'
@@ -43,9 +42,6 @@ def detect_type(line):
 
 # === PARSERS ===
 def parse_type_a(line):
-    """
-    2024-06-22 00:00:06 INFO [thread] cid=[...] txn=[...] LoggerClass : message
-    """
     m = re.match(
         r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) '
         r'(?P<level>\w+) \[(?P<thread>[^\]]+)\] '
@@ -59,20 +55,16 @@ def parse_type_a(line):
     return m.groupdict()
 
 def parse_type_b(line, next_line):
-    """
-    Metadata + JSON (either on same line or next).
-    We split on ' - ' then '~#' tokens, then flatten JSON.
-    """
-    # Split metadata and JSON
-    # If the JSON object starts on a new line, next_line holds it
-    if '{' in line and line.strip().endswith('}'):
-        meta, json_text = line.split(' {', 1)
-        json_text = '{' + json_text
+    # split out JSON
+    brace = line.find('{')
+    if brace >= 0:
+        meta = line[:brace].rstrip(' -')
+        json_text = line[brace:]
     else:
-        meta = line
+        # header only, JSON on next line
+        meta = line.rstrip(' -')
         json_text = next_line
 
-    # Meta: timestamp, thread, level, logger, rest
     mm = re.match(
         r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
         r'\[(?P<thread>[^\]]+)\]\s+'
@@ -84,23 +76,18 @@ def parse_type_b(line, next_line):
         raise ValueError("Type B meta regex failed")
     info = mm.groupdict()
 
-    # Split rest by '~#'
     parts = info['rest'].split('~#')
-    # parts: [service, endpoint, id, start_ts, end_ts, '']
-    service = parts[0]
-    endpoint = parts[1]
-    record_id = parts[2]
-    start_ts = parts[3]
-    end_ts = parts[4]
+    service, endpoint = parts[0], parts[1] if len(parts)>1 else ""
+    record_id = parts[2] if len(parts)>2 else ""
+    start_ts  = parts[3] if len(parts)>3 else ""
+    end_ts    = parts[4] if len(parts)>4 else ""
 
-    # Flatten JSON
     try:
         obj = json.loads(json_text)
     except Exception as e:
         raise ValueError(f"JSON decode error: {e}")
     flat = flatten_json(obj)
 
-    # Combine
     d = {
         "timestamp": info['timestamp'],
         "level":     info['level'],
@@ -112,15 +99,11 @@ def parse_type_b(line, next_line):
         "start_ts":  start_ts,
         "end_ts":    end_ts,
     }
-    # Merge flattened JSON under a single key 'json'
     for k,v in flat.items():
         d[f"json.{k}"] = v
     return d
 
 def parse_type_c(line):
-    """
-    2024-06-10 06:34:23,843 [thread] [INFO ] [Logger] - UKC:..., reqTime, respTime, maskedId, operation, ...
-    """
     mm = re.match(
         r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
         r'\[(?P<thread>[^\]]+)\]\s+'
@@ -132,90 +115,93 @@ def parse_type_c(line):
         raise ValueError("Type C meta regex failed")
     info = mm.groupdict()
     cols = [c.strip() for c in info['rest'].split(',')]
-    # unpack if enough parts
-    ukc, req_t, resp_t = cols[0], cols[1], cols[2]
-    masked = cols[3] if len(cols)>3 else ""
-    op     = cols[4] if len(cols)>4 else ""
-    other  = ",".join(cols[5:]) if len(cols)>5 else ""
+    ukc  = cols[0].split(':',1)[1] if ':' in cols[0] else cols[0]
+    req_t = cols[1] if len(cols)>1 else ""
+    resp_t= cols[2] if len(cols)>2 else ""
+    masked= cols[3] if len(cols)>3 else ""
+    op    = cols[4] if len(cols)>4 else ""
+    other = ",".join(cols[5:]) if len(cols)>5 else ""
     return {
-        "timestamp":     info['timestamp'],
-        "level":         info['level'],
-        "thread":        info['thread'],
-        "logger":        info['logger'],
-        "ukc":           ukc.split(':',1)[1] if ':' in ukc else ukc,
-        "request_time":  req_t,
-        "response_time": resp_t,
-        "masked_id":     masked,
-        "operation":     op,
-        "other":         other,
+        "timestamp":    info['timestamp'],
+        "level":        info['level'],
+        "thread":       info['thread'],
+        "logger":       info['logger'],
+        "ukc":          ukc,
+        "request_time": req_t,
+        "response_time":resp_t,
+        "masked_id":    masked,
+        "operation":    op,
+        "other":        other,
     }
 
-# === MAIN PROCESS ===
+# === PROCESS & PROGRESS BAR ===
 def main():
-    # Read all lines with numbers
+    # Load lines
     lines = []
     with open(INPUT_FILE, encoding='utf-8', errors='ignore') as f:
-        for i, raw in enumerate(f, start=1):
-            line = raw.rstrip('\r\n')
-            if line.strip():
-                lines.append((i, line))
+        for idx, raw in enumerate(f, start=1):
+            ln = raw.rstrip('\r\n')
+            if ln.strip():
+                lines.append((idx, ln))
 
-    parsed_rows = []
-    errors      = []
-
+    parsed = []
+    errors = []
     i = 0
+
+    pbar = tqdm(total=len(lines), desc="Parsing logs")
     while i < len(lines):
         line_no, line = lines[i]
         t = detect_type(line)
         try:
             if t == 'A':
                 rec = parse_type_a(line)
-                i += 1
+                step = 1
             elif t == 'B':
-                # grab next line as JSON payload
-                next_json = lines[i+1][1] if i+1 < len(lines) else ""
-                rec = parse_type_b(line, next_json)
-                i += 2
+                nxt = lines[i+1][1] if i+1 < len(lines) else ""
+                rec = parse_type_b(line, nxt)
+                step = 2
             elif t == 'C':
                 rec = parse_type_c(line)
-                i += 1
+                step = 1
             else:
                 raise ValueError("Unknown log type")
+            # find mobiles
+            for key, val in rec.items():
+                for m in MOBILE_REGEX.finditer(str(val)):
+                    parsed.append({
+                        "line_no": line_no,
+                        "type":    t,
+                        **rec,
+                        "match": m.group(1),
+                        "field": key
+                    })
         except Exception as e:
             errors.append({
                 "line_no": line_no,
                 "raw":     line,
                 "error":   str(e)
             })
-            i += 1
-            continue
+            step = 1
 
-        # find mobile matches across all fields
-        for key, val in rec.items():
-            for m in MOBILE_REGEX.finditer(str(val)):
-                parsed_rows.append({
-                    "type":         t,
-                    "line_no":      line_no,
-                    **rec,
-                    "match":        m.group(1),
-                    "field":        key
-                })
+        i += step
+        pbar.update(step)
+    pbar.close()
 
-    # --- Write Excel ---
+    # --- WRITE EXCEL ---
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
-    # Parsed sheet
-    ws1 = wb.add_worksheet("ParsedLogs")
-    headers = list(parsed_rows[0].keys()) if parsed_rows else []
-    for c, h in enumerate(headers):
-        ws1.write(0, c, h)
-    for r, row in enumerate(parsed_rows, start=1):
+    ws = wb.add_worksheet("ParsedLogs")
+    if parsed:
+        headers = list(parsed[0].keys())
         for c, h in enumerate(headers):
-            val = row.get(h, "")
-            if h == "match":
-                fmt = wb.add_format({"font_color":"red"})
-                ws1.write(r, c, val, fmt)
-            else:
-                ws1.write(r, c, val)
+            ws.write(0, c, h)
+        red = wb.add_format({"font_color":"red"})
+        for r, row in enumerate(parsed, start=1):
+            for c, h in enumerate(headers):
+                val = row.get(h, "")
+                if h == "match":
+                    ws.write(r, c, val, red)
+                else:
+                    ws.write(r, c, val)
     # Errors sheet
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0, 0, ["line_no", "raw", "error"])
@@ -225,34 +211,20 @@ def main():
         ws2.write(r, 2, err["error"])
     wb.close()
 
-    # --- Write Word ---
+    # --- WRITE WORD ---
     doc = Document()
-    for row in parsed_rows:
+    for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
-        # basic info
-        text = f"{row['type']} | {row['line_no']} | {row['timestamp']} | {row.get('thread','')} | "
-        p.add_run(text)
-        # match
+        p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
         run = p.add_run(row['match'])
         run.font.color.rgb = RGBColor(255, 0, 0)
-        run = p.add_run(f"  [{row['field']}]")
-        run.font.color.rgb = RGBColor(255, 0, 0)
+        p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # --- Summary ---
-    total_lines = len(lines)
-    total_matches = len(parsed_rows)
-    total_errors = len(errors)
-    counts = {"A":0, "B":0, "C":0}
-    for r in parsed_rows:
-        counts[r["type"]] += 1
-
-    print(f"Total lines: {total_lines}")
-    print(f"Total matches: {total_matches}")
-    print(f" • Type A: {counts['A']}")
-    print(f" • Type B: {counts['B']}")
-    print(f" • Type C: {counts['C']}")
-    print(f"Total errors: {total_errors}")
+    # --- SUMMARY ---
+    print(f"Total lines read : {len(lines)}")
+    print(f"Total mobiles found: {len(parsed)}")
+    print(f"Total parse errors: {len(errors)}")
 
 if __name__ == "__main__":
     main()
