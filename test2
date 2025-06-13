@@ -4,165 +4,103 @@ import json
 import xlsxwriter
 from tqdm import tqdm
 
-# === CONFIG ===
 INPUT_FILE  = "input.txt"
 OUTPUT_FILE = "ParsedLogs_Test.xlsx"
 
-# Timestamp at start (optional ms)
-TIMESTAMP_RE = re.compile(
-    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\s'
-)
+# Detect Type B by presence of ~#~
+def is_type_b(line):
+    return "~#~" in line
 
-def detect_type(line):
-    if ' cid=[' in line and ' txn=[' in line:
-        return 'A'
-    if '~#~' in line:
-        return 'B'
-    if 'UKC:' in line:
-        return 'C'
-    return 'Unknown'
-
-def parse_type_a(line):
-    m = re.match(
-        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
-        r'(?P<level>\w+)\s+\[(?P<thread>[^\]]+)\]\s+'
-        r'cid=\[(?P<cid>[^\]]*)\]\s+'
-        r'txn=\[(?P<txn>[^\]]*)\]\s+'
-        r'(?P<logger>\w+)\s*:\s*(?P<message>.+)$',
-        line
-    )
-    return m.groupdict() if m else {"parse_error": "Type A failed"}
+def flatten(obj, prefix=""):
+    flat = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten(v, path + "."))
+            else:
+                flat[path] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            flat.update(flatten(item, f"{prefix}[{i}]."))
+    return flat
 
 def parse_type_b(line):
-    # 1) Extract timestamp/thread/level/logger from the beginning
-    ts_m = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)', line)
-    timestamp = ts_m.group(1) if ts_m else ""
-    br = re.search(r'\[([^\]]+)\]\s*\[([^\]]+)\]\s*\[([^\]]+)\]', line)
-    thread, level, logger = (br.group(1), br.group(2).strip(), br.group(3)) if br else ("","","")
+    # 1) Strip off everything before the payload
+    after_dash = line.split("] - ", 1)[1] if "] - " in line else line
 
-    # 2) Isolate the part after "] - "
-    if '] - ' in line:
-        after_dash = line.split('] - ',1)[1]
-    else:
-        after_dash = line
-
-    # 3) Find the last occurrence of "~#~{"
-    idx = after_dash.rfind('~#~{')
+    # 2) Metadata is up to and including the first "~#~" before JSON
+    idx = after_dash.find("~#~{")
     if idx != -1:
-        metadata = after_dash[:idx+3]   # include "~#~"
-        payload  = after_dash[idx+3:]   # starts at "{"
+        metadata = after_dash[:idx+3]  # include "~#~"
+        rest      = after_dash[idx+3:] # starts at "{"
     else:
         metadata = after_dash
-        payload  = ""
+        rest     = ""
 
-    # 4) Try flattening JSON in payload (ignore errors)
+    # 3) Split rest on "~#~", take only those that begin with "{"
+    parts = rest.split("~#~")
+    json_parts = [p for p in parts if p.strip().startswith("{")]
+
+    # 4) Reconstruct payload (just the JSON bits, joined by "~#~")
+    payload = "~#~".join(json_parts)
+
+    # 5) Flatten each JSON part under payload[i].
     flat = {}
-    try:
-        obj = json.loads(payload)
-        def _flatten(o, pre=""):
-            out = {}
-            if isinstance(o, dict):
-                for k,v in o.items():
-                    key = f"{pre}{k}"
-                    if isinstance(v,(dict,list)):
-                        out.update(_flatten(v, key+"."))
-                    else:
-                        out[key] = v
-            elif isinstance(o, list):
-                for i,item in enumerate(o):
-                    out.update(_flatten(item, f"{pre}[{i}]."))
-            return out
-        flat = _flatten(obj)
-    except:
-        pass
+    for i, jp in enumerate(json_parts):
+        try:
+            obj = json.loads(jp)
+            for k, v in flatten(obj).items():
+                flat[f"payload[{i}].{k}"] = v
+        except json.JSONDecodeError:
+            flat[f"payload[{i}].parse_error"] = "invalid JSON"
 
-    # 5) Build record
-    rec = {
-        "timestamp": timestamp,
-        "thread":    thread,
-        "level":     level,
-        "logger":    logger,
-        "metadata":  metadata,
-        "payload":   payload,
+    return {
+        "metadata": metadata,
+        "payload":  payload,
+        **flat
     }
-    for k,v in flat.items():
-        rec[f"json.{k}"] = v
-    return rec
-
-def parse_type_c(line):
-    m = re.match(
-        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
-        r'\[(?P<thread>[^\]]+)\]\s+'
-        r'\[(?P<level>\w+)\s*\]\s+'
-        r'\[(?P<logger>[^\]]+)\]\s*-\s*(?P<rest>.+)$',
-        line
-    )
-    if not m:
-        return {"parse_error": "Type C failed"}
-    info = m.groupdict()
-    parts = [p.strip() for p in info['rest'].split(',')]
-    rec = {
-        "timestamp":    info['timestamp'],
-        "thread":       info['thread'],
-        "level":        info['level'],
-        "logger":       info['logger'],
-    }
-    rec["ukc"]           = parts[0].split(':',1)[1] if parts and ':' in parts[0] else parts[0] if parts else ""
-    rec["request_time"]  = parts[1] if len(parts)>1 else ""
-    rec["response_time"] = parts[2] if len(parts)>2 else ""
-    rec["masked_id"]     = parts[3] if len(parts)>3 else ""
-    rec["operation"]     = parts[4] if len(parts)>4 else ""
-    rec["other"]         = ",".join(parts[5:]) if len(parts)>5 else ""
-    return rec
 
 def main():
-    # 1. Read all non-empty lines
-    raw = []
-    with open(INPUT_FILE, encoding='utf-8', errors='ignore') as f:
+    # Read lines
+    lines = []
+    with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for idx, ln in enumerate(f, start=1):
-            txt = ln.rstrip('\n')
+            txt = ln.rstrip("\n")
             if txt.strip():
-                raw.append((idx, txt))
+                lines.append((idx, txt))
 
-    # 2. Treat each timestamped line as one log
-    logs = [ {"start_line": ln, "line": txt}
-             for ln, txt in raw
-             if TIMESTAMP_RE.match(txt) ]
-
-    # 3. Parse each log
+    # Parse only Type B
     records = []
-    for rec in tqdm(logs, desc="Parsing logs"):
-        ln0, line = rec["start_line"], rec["line"]
-        t = detect_type(line)
-        if t == 'A':
-            data = parse_type_a(line)
-        elif t == 'B':
-            data = parse_type_b(line)
-        elif t == 'C':
-            data = parse_type_c(line)
-        else:
-            data = {"parse_error": "Unknown type"}
-        data["line_no"] = ln0
-        data["type"]    = t
+    for line_no, line in tqdm(lines, desc="Parsing Type B logs"):
+        if not is_type_b(line):
+            continue
+        data = parse_type_b(line)
+        data["line_no"] = line_no
         records.append(data)
 
-    # 4. Write to Excel for validation
+    # Write to Excel
     wb = xlsxwriter.Workbook(OUTPUT_FILE)
-    ws = wb.add_worksheet("ParsedLogs")
-    # dynamic headers
-    headers = []
-    for row in records:
-        for key in row:
-            if key not in headers:
-                headers.append(key)
-    for col, h in enumerate(headers):
-        ws.write(0, col, h)
-    for r, row in enumerate(records, start=1):
-        for c, h in enumerate(headers):
-            ws.write(r, c, row.get(h, ""))
-    wb.close()
+    ws = wb.add_worksheet("TypeB_Validation")
 
-    print(f"Validation workbook '{OUTPUT_FILE}' created with {len(records)} rows.")
+    # Dynamic headers
+    headers = []
+    for rec in records:
+        for k in rec:
+            if k not in headers:
+                headers.append(k)
+
+    # Write headers
+    for c, h in enumerate(headers):
+        ws.write(0, c, h)
+
+    # Write rows
+    for r, rec in enumerate(records, start=1):
+        for c, h in enumerate(headers):
+            ws.write(r, c, rec.get(h, ""))
+
+    wb.close()
+    print(f"Validation workbook '{OUTPUT_FILE}' with {len(records)} rows written.")
 
 if __name__ == "__main__":
     main()
