@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+import re
+import json
+import sys
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+INPUT_FILE   = "input.txt"
+OUTPUT_XLSX  = "applogs_dl.xlsx"
+OUTPUT_DOCX  = "applogs_dl.docx"
+
+# Driving-License regex
+DL_REGEX = re.compile(r"[A-Z]{2}\d{2}[-\s]?\d{4}\d{7}")
+
+# Timestamp detection (with optional ms)
+TIMESTAMP_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\s'
+)
+
+# Header regex for Type B
+HEADER_B_RE = re.compile(
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
+    r'\[(?P<thread>[^\]]+)\]\s+'
+    r'\[(?P<level>\w+)\s*\]\s+'
+    r'\[(?P<logger>[^\]]+)\]\s*-\s*'
+    r'(?P<rest>.+)$'
+)
+
+def flatten_json(o, prefix=""):
+    out = {}
+    if isinstance(o, dict):
+        for k, v in o.items():
+            key = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                out.update(flatten_json(v, key + "."))
+            else:
+                out[key] = v
+    elif isinstance(o, list):
+        for i, item in enumerate(o):
+            out.update(flatten_json(item, f"{prefix}[{i}]."))
+    return out
+
+def detect_type(line):
+    if ' cid=[' in line and ' txn=[' in line:
+        return 'A'
+    if '~#~' in line:
+        return 'B'
+    if 'UKC:' in line:
+        return 'C'
+    return None
+
+def parse_type_a(line):
+    m = re.match(
+        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+'
+        r'(?P<level>\w+)\s+\[(?P<thread>[^\]]+)\]\s+'
+        r'cid=\[(?P<cid>[^\]]*)\]\s+'
+        r'txn=\[(?P<txn>[^\]]*)\]\s+'
+        r'(?P<logger>\w+)\s*:\s*(?P<message>.+)$',
+        line
+    )
+    if not m:
+        raise ValueError("Type A parse error")
+    return m.groupdict()
+
+def parse_type_b(line):
+    mb = HEADER_B_RE.match(line)
+    if not mb:
+        raise ValueError("Type B header parse failed")
+    hdr = mb.groupdict()
+    rest = hdr.pop("rest")
+
+    segments = []
+    pos = 0
+    while True:
+        start = rest.find("{", pos)
+        if start == -1:
+            tail = rest[pos:].strip()
+            if tail:
+                segments.append(("metadata", tail))
+            break
+
+        if start > pos:
+            meta = rest[pos:start].strip()
+            if meta:
+                segments.append(("metadata", meta))
+
+        depth = 0
+        end = start
+        for i, ch in enumerate(rest[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+
+        payload = rest[start:end+1]
+        segments.append(("payload", payload))
+        pos = end + 1
+
+    rec = {
+        "timestamp": hdr["timestamp"],
+        "thread":    hdr["thread"],
+        "level":     hdr["level"],
+        "logger":    hdr["logger"],
+    }
+
+    meta_i = 0
+    pay_i  = 0
+    for kind, txt in segments:
+        if kind == "metadata":
+            rec[f"metadata_{meta_i}"] = txt
+            meta_i += 1
+        else:
+            rec[f"payload_{pay_i}"] = txt
+            try:
+                obj = json.loads(txt)
+                for k, v in flatten_json(obj).items():
+                    rec[f"payload_{pay_i}.{k}"] = v
+            except:
+                rec[f"payload_{pay_i}.parse_error"] = "invalid JSON"
+            pay_i += 1
+
+    return rec
+
+def parse_type_c(line):
+    m = re.match(
+        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
+        r'\[(?P<thread>[^\]]+)\]\s+'
+        r'\[(?P<level>\w+)\s*\]\s+'
+        r'\[(?P<logger>[^\]]+)\]\s*-\s*(?P<rest>.+)$',
+        line
+    )
+    if not m:
+        raise ValueError("Type C parse error")
+    info = m.groupdict()
+    parts = [p.strip() for p in info['rest'].split(',')]
+    return {
+        "timestamp":     info['timestamp'],
+        "thread":        info['thread'],
+        "level":         info['level'],
+        "logger":        info['logger'],
+        "ukc":           parts[0].split(':',1)[1] if ':' in parts[0] else parts[0],
+        "request_time":  parts[1] if len(parts)>1 else "",
+        "response_time": parts[2] if len(parts)>2 else "",
+        "masked_id":     parts[3] if len(parts)>3 else "",
+        "operation":     parts[4] if len(parts)>4 else "",
+        "other":         ",".join(parts[5:]) if len(parts)>5 else ""
+    }
+
+def main():
+    lines = []
+    with open(INPUT_FILE, encoding='utf-8', errors='ignore') as f:
+        for i, raw in enumerate(f, start=1):
+            ln = raw.rstrip('\n')
+            if ln.strip():
+                lines.append((i, ln))
+
+    logs = [(i, ln) for i, ln in lines if TIMESTAMP_RE.match(ln)]
+    total_logs = len(logs)
+
+    parsed = []
+    errors = []
+
+    for line_no, line in tqdm(logs, desc="Parsing logs"):
+        t = detect_type(line)
+        try:
+            if t == 'A':
+                data = parse_type_a(line)
+            elif t == 'B':
+                data = parse_type_b(line)
+            elif t == 'C':
+                data = parse_type_c(line)
+            else:
+                raise ValueError("Unknown log type")
+        except Exception as e:
+            errors.append({"line_no": line_no, "raw": line, "error": str(e)})
+            continue
+
+        # scan for DL numbers
+        for field, val in data.items():
+            for m in DL_REGEX.finditer(str(val)):
+                parsed.append({
+                    "line_no":  line_no,
+                    "type":     t,
+                    **data,
+                    "match":    m.group(0),
+                    "field":    field
+                })
+
+    # write Excel
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws1 = wb.add_worksheet("ParsedLogs")
+    if parsed:
+        headers = list(parsed[0].keys())
+        for c, h in enumerate(headers):
+            ws1.write(0, c, h)
+        red = wb.add_format({"font_color":"red"})
+        for r, row in enumerate(parsed, start=1):
+            for c, h in enumerate(headers):
+                val = row.get(h, "")
+                ws1.write(r, c, val, red if h=="match" else None)
+    ws2 = wb.add_worksheet("Errors")
+    ws2.write_row(0,0,["line_no","raw","error"])
+    for r, err in enumerate(errors, start=1):
+        ws2.write(r,0,err["line_no"])
+        ws2.write(r,1,err["raw"])
+        ws2.write(r,2,err["error"])
+    wb.close()
+
+    # write Word
+    doc = Document()
+    for row in tqdm(parsed, desc="Generating Word"):
+        p = doc.add_paragraph()
+        p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
+        run = p.add_run(row['match'])
+        run.font.color.rgb = RGBColor(255,0,0)
+        p.add_run(f" [{row['field']}]")
+    doc.save(OUTPUT_DOCX)
+
+    print(f"Total logs           : {total_logs}")
+    print(f"Total DL matches     : {len(parsed)}")
+    print(f"Parse errors         : {len(errors)}")
+
+if __name__ == "__main__":
+    main()
