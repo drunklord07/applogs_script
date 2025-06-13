@@ -33,20 +33,23 @@ def parse_type_a(line):
     )
     return m.groupdict() if m else {"parse_error": "Type A failed"}
 
-def parse_type_b(line):
-    # 1) Extract timestamp, thread, level, logger
-    ts_m = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)', line)
+def parse_type_b(lines):
+    # Combine all lines of this log
+    full = "\n".join(txt for _, txt in lines)
+    # Extract timestamp, thread, level, logger from first line
+    first = lines[0][1]
+    ts_m = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)', first)
     timestamp = ts_m.group(1) if ts_m else ""
-    br = re.search(r'\[([^\]]+)\]\s*\[([^\]]+)\]\s*\[([^\]]+)\]', line)
+    br = re.search(r'\[([^\]]+)\]\s*\[([^\]]+)\]\s*\[([^\]]+)\]', first)
     thread, level, logger = (br.group(1), br.group(2).strip(), br.group(3)) if br else ("","","")
-    # 2) Locate last "~#~"
-    last = line.rfind("~#~")
-    # metadata = text between "] - " and last marker
-    after_dash = line.split("] - ",1)[1] if "] - " in line else ""
-    metadata = after_dash[: last - line.index(after_dash)] if last != -1 else after_dash
-    # payload = everything after the last "~#~"
-    payload = line[last+3:] if last != -1 else ""
-    # 3) Attempt JSON flatten
+    # Split on the LAST "~#~" occurrence
+    if "~#~" in full:
+        metadata, payload = full.rsplit("~#~", 1)
+    else:
+        metadata, payload = full, ""
+    # Remove any leading "\n" from payload
+    payload = payload.lstrip("\n")
+    # Attempt to flatten JSON in payload
     flat = {}
     try:
         obj = json.loads(payload)
@@ -55,8 +58,8 @@ def parse_type_b(line):
             if isinstance(o, dict):
                 for k,v in o.items():
                     key = f"{pre}{k}"
-                    if isinstance(v, (dict,list)):
-                        out.update(_flatten(v, key+"."))
+                    if isinstance(v, (dict, list)):
+                        out.update(_flatten(v, key + "."))
                     else:
                         out[key] = v
             elif isinstance(o, list):
@@ -66,6 +69,7 @@ def parse_type_b(line):
         flat = _flatten(obj)
     except:
         pass
+
     rec = {
         "timestamp": timestamp,
         "thread":    thread,
@@ -74,6 +78,7 @@ def parse_type_b(line):
         "metadata":  metadata,
         "payload":   payload
     }
+    # Merge any flattened JSON fields
     for k,v in flat.items():
         rec[f"json.{k}"] = v
     return rec
@@ -96,7 +101,7 @@ def parse_type_c(line):
         "level":        info['level'],
         "logger":       info['logger'],
     }
-    rec["ukc"]           = parts[0].split(':',1)[1] if ':' in parts[0] else parts[0]
+    rec["ukc"]           = parts[0].split(':',1)[1] if parts and ':' in parts[0] else parts[0] if parts else ""
     rec["request_time"]  = parts[1] if len(parts)>1 else ""
     rec["response_time"] = parts[2] if len(parts)>2 else ""
     rec["masked_id"]     = parts[3] if len(parts)>3 else ""
@@ -105,7 +110,7 @@ def parse_type_c(line):
     return rec
 
 def main():
-    # 1. Load all non-empty lines
+    # 1) Read all non-empty lines with their numbers
     raw = []
     with open(INPUT_FILE, encoding='utf-8', errors='ignore') as f:
         for idx, ln in enumerate(f, start=1):
@@ -113,43 +118,48 @@ def main():
             if txt.strip():
                 raw.append((idx, txt))
 
-    # 2. Treat each line as a single log
-    logs = [{"start_line": ln_no, "line": txt} for ln_no, txt in raw if TIMESTAMP_RE.match(txt)]
+    # 2) Group into multi-line logs by timestamp at start
+    logs = []
+    for ln_no, txt in raw:
+        if TIMESTAMP_RE.match(txt):
+            logs.append({"start_line": ln_no, "lines": [(ln_no, txt)]})
+        else:
+            if logs:
+                logs[-1]["lines"].append((ln_no, txt))
 
-    # 3. Parse each
+    # 3) Parse each log
     records = []
     for rec in tqdm(logs, desc="Parsing logs"):
-        ln0, line = rec["start_line"], rec["line"]
-        t = detect_type(line)
-        if t == 'A':
-            data = parse_type_a(line)
-        elif t == 'B':
-            data = parse_type_b(line)
-        elif t == 'C':
-            data = parse_type_c(line)
+        ln0 = rec["start_line"]
+        if detect_type(rec["lines"][0][1]) == 'A':
+            data = parse_type_a(rec["lines"][0][1])
+        elif detect_type(rec["lines"][0][1]) == 'B':
+            data = parse_type_b(rec["lines"])
+        elif detect_type(rec["lines"][0][1]) == 'C':
+            data = parse_type_c(rec["lines"][0][1])
         else:
             data = {"parse_error": "Unknown type"}
         data["line_no"] = ln0
-        data["type"]    = t
+        data["type"]    = detect_type(rec["lines"][0][1])
         records.append(data)
 
-    # 4. Write Excel
+    # 4) Write to Excel for validation
     wb = xlsxwriter.Workbook(OUTPUT_FILE)
     ws = wb.add_worksheet("ParsedLogs")
-    # dynamic headers
+    # Dynamic headers
     headers = []
-    for r in records:
-        for k in r:
-            if k not in headers:
-                headers.append(k)
-    for c,h in enumerate(headers):
-        ws.write(0, c, h)
-    for r,row in enumerate(records, start=1):
-        for c,h in enumerate(headers):
+    for row in records:
+        for key in row:
+            if key not in headers:
+                headers.append(key)
+    for col, h in enumerate(headers):
+        ws.write(0, col, h)
+    for r, row in enumerate(records, start=1):
+        for c, h in enumerate(headers):
             ws.write(r, c, row.get(h, ""))
     wb.close()
 
     print(f"Validation workbook '{OUTPUT_FILE}' created with {len(records)} rows.")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
