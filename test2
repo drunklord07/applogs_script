@@ -7,100 +7,134 @@ from tqdm import tqdm
 INPUT_FILE  = "input.txt"
 OUTPUT_FILE = "ParsedLogs_Test.xlsx"
 
-# Detect Type B by presence of ~#~
-def is_type_b(line):
-    return "~#~" in line
+# 1) Header regex
+HEADER_RE = re.compile(
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
+    r'\[(?P<thread>[^\]]+)\]\s+'
+    r'\[(?P<level>\w+)\s*\]\s+'
+    r'\[(?P<logger>[^\]]+)\]\s*-\s*'
+    r'(?P<rest>.+)$'
+)
 
-def flatten(obj, prefix=""):
-    flat = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            path = f"{prefix}{k}"
-            if isinstance(v, (dict, list)):
-                flat.update(flatten(v, path + "."))
+def flatten(o, prefix=""):
+    out = {}
+    if isinstance(o, dict):
+        for k,v in o.items():
+            key = f"{prefix}{k}"
+            if isinstance(v,(dict,list)):
+                out.update(flatten(v, key + "."))
             else:
-                flat[path] = v
-    elif isinstance(obj, list):
-        for i, item in enumerate(obj):
-            flat.update(flatten(item, f"{prefix}[{i}]."))
-    return flat
+                out[key] = v
+    elif isinstance(o, list):
+        for i,item in enumerate(o):
+            out.update(flatten(item, f"{prefix}[{i}]."))
+    return out
 
 def parse_type_b(line):
-    # 1) Strip off everything before the payload
-    after_dash = line.split("] - ", 1)[1] if "] - " in line else line
+    m = HEADER_RE.match(line)
+    if not m:
+        raise ValueError("Header parse failed")
+    hdr = m.groupdict()
+    rest = hdr.pop("rest")
 
-    # 2) Metadata is up to and including the first "~#~" before JSON
-    idx = after_dash.find("~#~{")
-    if idx != -1:
-        metadata = after_dash[:idx+3]  # include "~#~"
-        rest      = after_dash[idx+3:] # starts at "{"
-    else:
-        metadata = after_dash
-        rest     = ""
+    segments = []
+    pos = 0
+    length = len(rest)
 
-    # 3) Split rest on "~#~", take only those that begin with "{"
-    parts = rest.split("~#~")
-    json_parts = [p for p in parts if p.strip().startswith("{")]
+    while True:
+        # find next JSON
+        start = rest.find("{", pos)
+        if start == -1:
+            # trailing metadata
+            tail = rest[pos:].strip()
+            if tail:
+                segments.append(("metadata", tail))
+            break
 
-    # 4) Reconstruct payload (just the JSON bits, joined by "~#~")
-    payload = "~#~".join(json_parts)
+        # metadata before JSON
+        if start > pos:
+            meta = rest[pos:start].strip()
+            if meta:
+                segments.append(("metadata", meta))
 
-    # 5) Flatten each JSON part under payload[i].
-    flat = {}
-    for i, jp in enumerate(json_parts):
-        try:
-            obj = json.loads(jp)
-            for k, v in flatten(obj).items():
-                flat[f"payload[{i}].{k}"] = v
-        except json.JSONDecodeError:
-            flat[f"payload[{i}].parse_error"] = "invalid JSON"
+        # find matching brace
+        depth = 0
+        end = start
+        for i, ch in enumerate(rest[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
 
-    return {
-        "metadata": metadata,
-        "payload":  payload,
-        **flat
+        payload = rest[start:end+1]
+        segments.append(("payload", payload))
+        pos = end+1
+
+    # build record
+    rec = {
+        "timestamp": hdr["timestamp"],
+        "thread":    hdr["thread"],
+        "level":     hdr["level"],
+        "logger":    hdr["logger"],
     }
 
+    # assign metadata_i and payload_i, and flatten payloads
+    payload_count = 0
+    meta_count    = 0
+    for kind, text in segments:
+        if kind == "metadata":
+            rec[f"metadata_{meta_count}"] = text
+            meta_count += 1
+        else:  # payload
+            rec[f"payload_{payload_count}"] = text
+            # flatten this JSON
+            try:
+                obj = json.loads(text)
+                flat = flatten(obj)
+                for k,v in flat.items():
+                    rec[f"payload_{payload_count}.{k}"] = v
+            except:
+                rec[f"payload_{payload_count}.parse_error"] = "invalid JSON"
+            payload_count += 1
+
+    return rec
+
 def main():
-    # Read lines
-    lines = []
+    records = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for idx, ln in enumerate(f, start=1):
-            txt = ln.rstrip("\n")
-            if txt.strip():
-                lines.append((idx, txt))
+            txt = ln.strip()
+            if not txt or "~#~" not in txt:
+                continue
+            try:
+                rec = parse_type_b(txt)
+                rec["line_no"] = idx
+                records.append(rec)
+            except Exception as e:
+                print(f"Line {idx} error: {e}")
 
-    # Parse only Type B
-    records = []
-    for line_no, line in tqdm(lines, desc="Parsing Type B logs"):
-        if not is_type_b(line):
-            continue
-        data = parse_type_b(line)
-        data["line_no"] = line_no
-        records.append(data)
-
-    # Write to Excel
+    # write to Excel
     wb = xlsxwriter.Workbook(OUTPUT_FILE)
     ws = wb.add_worksheet("TypeB_Validation")
 
-    # Dynamic headers
+    # dynamic headers
     headers = []
-    for rec in records:
-        for k in rec:
-            if k not in headers:
-                headers.append(k)
+    for r in records:
+        for h in r:
+            if h not in headers:
+                headers.append(h)
 
-    # Write headers
-    for c, h in enumerate(headers):
+    for c,h in enumerate(headers):
         ws.write(0, c, h)
-
-    # Write rows
-    for r, rec in enumerate(records, start=1):
-        for c, h in enumerate(headers):
+    for r,rec in enumerate(records, start=1):
+        for c,h in enumerate(headers):
             ws.write(r, c, rec.get(h, ""))
 
     wb.close()
-    print(f"Validation workbook '{OUTPUT_FILE}' with {len(records)} rows written.")
+    print(f"Wrote {len(records)} rows to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
