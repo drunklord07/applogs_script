@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import re
 import json
-import sys
 from docx import Document
 from docx.shared import RGBColor
 import xlsxwriter
@@ -18,7 +17,7 @@ MOBILE_REGEX = re.compile(
     r'(?![A-Za-z0-9])'
 )
 
-# Timestamp detection
+# Timestamp detection (with optional ms)
 TIMESTAMP_RE = re.compile(
     r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\s'
 )
@@ -47,6 +46,7 @@ def flatten_json(o, prefix=""):
     return out
 
 def parse_type_a(line):
+    # now accepts optional ,ms in timestamp, and logger up to colon
     m = re.match(
         r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
         r'(?P<level>\w+)\s+\[(?P<thread>[^\]]+)\]\s+'
@@ -147,90 +147,73 @@ def parse_type_c(line):
     }
 
 def main():
-    # load lines
-    lines = []
+    # load only non-blank, timestamped lines
+    logs = []
     with open(INPUT_FILE, encoding='utf-8', errors='ignore') as f:
         for i, raw in enumerate(f, start=1):
             ln = raw.rstrip('\n')
-            if ln.strip():
-                lines.append((i, ln))
+            if ln.strip() and TIMESTAMP_RE.match(ln):
+                logs.append((i, ln))
 
-    # only take timestamped lines
-    logs = [(i, ln) for i, ln in lines if TIMESTAMP_RE.match(ln)]
     total_logs = len(logs)
-
     parsed = []
     errors = []
 
     for line_no, line in tqdm(logs, desc="Parsing logs"):
-        data = None
-        t = None
-
-        # try Type A
-        try:
-            data = parse_type_a(line)
-            t = 'A'
-        except:
-            # then Type B if ~#~ present
-            if "~#~" in line:
-                try:
-                    data = parse_type_b(line)
-                    t = 'B'
-                except Exception as e:
-                    errors.append({"line_no": line_no, "raw": line, "error": f"B: {e}"})
-                    continue
-            # then Type C if UKC:
-            elif "UKC:" in line:
-                try:
-                    data = parse_type_c(line)
-                    t = 'C'
-                except Exception as e:
-                    errors.append({"line_no": line_no, "raw": line, "error": f"C: {e}"})
-                    continue
-            else:
-                errors.append({"line_no": line_no, "raw": line, "error": "No matching parser"})
+        # try each parser in order
+        for parser, t in [(parse_type_a,'A'),
+                          (parse_type_b,'B'),
+                          (parse_type_c,'C')]:
+            try:
+                data = parser(line)
+                log_type = t
+                break
+            except:
                 continue
+        else:
+            errors.append({"line_no":line_no,"raw":line,"error":"No parser matched"})
+            continue
 
-        # mobile scanning
+        # mobile scan; skip raw payload_i & metadata_i in B
         for fld, val in data.items():
-            # skip raw payload and metadata for B
-            if t=='B' and ((fld.startswith("payload_") and "." not in fld) or fld.startswith("metadata_")):
+            if log_type=='B' and ((fld.startswith("payload_") and "." not in fld)
+                                  or fld.startswith("metadata_")):
                 continue
             for m in MOBILE_REGEX.finditer(str(val)):
                 parsed.append({
                     "line_no":  line_no,
-                    "type":     t,
+                    "type":     log_type,
                     **data,
                     "match":    m.group(1),
                     "field":    fld
                 })
 
-    # write Excel
+    # Write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
         hdrs = list(parsed[0].keys())
-        for c,h in enumerate(hdrs):
+        for c, h in enumerate(hdrs):
             ws1.write(0, c, h)
         red = wb.add_format({"font_color":"red"})
-        for r,row in enumerate(parsed, start=1):
-            for c,h in enumerate(hdrs):
+        for r, row in enumerate(parsed, start=1):
+            for c, h in enumerate(hdrs):
                 v = row.get(h,"")
                 ws1.write(r, c, v, red if h=="match" else None)
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0,0,["line_no","raw","error"])
-    for r,err in enumerate(errors, start=1):
-        ws2.write(r,0,err["line_no"])
-        ws2.write(r,1,err["raw"])
-        ws2.write(r,2,err["error"])
+    for r, e in enumerate(errors, start=1):
+        ws2.write(r,0,e["line_no"])
+        ws2.write(r,1,e["raw"])
+        ws2.write(r,2,e["error"])
     wb.close()
 
-    # write Word
+    # Write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
         p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
-        rr = p.add_run(row['match']); rr.font.color.rgb = RGBColor(255,0,0)
+        run = p.add_run(row['match']); run.font.color.rgb = RGBColor(255,0,0)
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
