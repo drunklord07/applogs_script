@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import re
 import json
+import sys
 from docx import Document
 from docx.shared import RGBColor
 import xlsxwriter
@@ -36,7 +37,7 @@ def flatten_json(o, prefix=""):
     if isinstance(o, dict):
         for k,v in o.items():
             key = f"{prefix}{k}"
-            if isinstance(v, (dict, list)):
+            if isinstance(v, (dict,list)):
                 out.update(flatten_json(v, key + "."))
             else:
                 out[key] = v
@@ -45,56 +46,52 @@ def flatten_json(o, prefix=""):
             out.update(flatten_json(item, f"{prefix}[{i}]."))
     return out
 
-def parse_type_a(line):
-    # now accepts optional ,ms in timestamp, and logger up to colon
+def parse_type_a(text):
+    # one-line Type A
     m = re.match(
         r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
         r'(?P<level>\w+)\s+\[(?P<thread>[^\]]+)\]\s+'
         r'cid=\[(?P<cid>[^\]]*)\]\s+'
         r'txn=\[(?P<txn>[^\]]*)\]\s+'
         r'(?P<logger>[^:]+?)\s*:\s*(?P<message>.+)$',
-        line
+        text
     )
     if not m:
         raise ValueError("Type A parse error")
     return m.groupdict()
 
-def parse_type_b(line):
-    mb = HEADER_B_RE.match(line)
+def parse_type_b(lines):
+    # multi-line Type B: first line header + all payload lines
+    full = "\n".join(line for _,line in lines)
+    header_line = lines[0][1]
+    mb = HEADER_B_RE.match(header_line)
     if not mb:
         raise ValueError("Type B header parse failed")
     hdr = mb.groupdict()
-    rest = hdr.pop("rest")
+    rest = hdr.pop("rest") + "\n" + "\n".join(line for _,line in lines[1:])
 
-    segments = []
-    pos = 0
+    # split metadata/payload by brace-matching
+    segs, pos = [], 0
     while True:
         start = rest.find("{", pos)
-        if start == -1:
+        if start<0:
             tail = rest[pos:].strip()
-            if tail:
-                segments.append(("metadata", tail))
+            if tail: segs.append(("metadata", tail))
             break
-
-        if start > pos:
+        if start>pos:
             meta = rest[pos:start].strip()
-            if meta:
-                segments.append(("metadata", meta))
-
-        depth = 0
-        end = start
-        for i, ch in enumerate(rest[start:], start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i
+            if meta: segs.append(("metadata",meta))
+        depth,end = 0, start
+        for i,ch in enumerate(rest[start:],start):
+            if ch=="{": depth+=1
+            elif ch=="}":
+                depth-=1
+                if depth==0:
+                    end=i
                     break
-
         payload = rest[start:end+1]
-        segments.append(("payload", payload))
-        pos = end + 1
+        segs.append(("payload",payload))
+        pos = end+1
 
     rec = {
         "timestamp": hdr["timestamp"],
@@ -103,121 +100,139 @@ def parse_type_b(line):
         "logger":    hdr["logger"],
     }
 
-    meta_i = 0
-    pay_i  = 0
-    for kind, txt in segments:
-        if kind == "metadata":
-            rec[f"metadata_{meta_i}"] = txt
-            meta_i += 1
+    mi,pi = 0,0
+    for kind,txt in segs:
+        if kind=="metadata":
+            rec[f"metadata_{mi}"] = txt
+            mi+=1
         else:
-            rec[f"payload_{pay_i}"] = txt
+            rec[f"payload_{pi}"] = txt
             try:
                 obj = json.loads(txt)
                 for k,v in flatten_json(obj).items():
-                    rec[f"payload_{pay_i}.{k}"] = v
+                    rec[f"payload_{pi}.{k}"] = v
             except:
-                rec[f"payload_{pay_i}.parse_error"] = "invalid JSON"
-            pay_i += 1
+                rec[f"payload_{pi}.parse_error"] = "invalid JSON"
+            pi+=1
 
     return rec
 
-def parse_type_c(line):
+def parse_type_c(text):
+    # one-line Type C
     m = re.match(
         r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
         r'\[(?P<thread>[^\]]+)\]\s+'
         r'\[(?P<level>\w+)\s*\]\s+'
         r'\[(?P<logger>[^\]]+)\]\s*-\s*(?P<rest>.+)$',
-        line
+        text
     )
     if not m:
         raise ValueError("Type C parse error")
     info = m.groupdict()
-    parts = [p.strip() for p in info['rest'].split(',')]
+    parts = [p.strip() for p in info['rest'].split(",")]
     return {
-        "timestamp":     info['timestamp'],
-        "thread":        info['thread'],
-        "level":         info['level'],
-        "logger":        info['logger'],
-        "ukc":           parts[0].split(':',1)[1] if ':' in parts[0] else parts[0],
-        "request_time":  parts[1] if len(parts)>1 else "",
-        "response_time": parts[2] if len(parts)>2 else "",
-        "masked_id":     parts[3] if len(parts)>3 else "",
-        "operation":     parts[4] if len(parts)>4 else "",
-        "other":         ",".join(parts[5:]) if len(parts)>5 else ""
+        "timestamp":    info["timestamp"],
+        "thread":       info["thread"],
+        "level":        info["level"],
+        "logger":       info["logger"],
+        "ukc":          parts[0].split(":",1)[1] if ":" in parts[0] else parts[0],
+        "request_time": parts[1] if len(parts)>1 else "",
+        "response_time":parts[2] if len(parts)>2 else "",
+        "masked_id":    parts[3] if len(parts)>3 else "",
+        "operation":    parts[4] if len(parts)>4 else "",
+        "other":        ",".join(parts[5:]) if len(parts)>5 else ""
     }
 
 def main():
-    # load only non-blank, timestamped lines
-    logs = []
-    with open(INPUT_FILE, encoding='utf-8', errors='ignore') as f:
-        for i, raw in enumerate(f, start=1):
-            ln = raw.rstrip('\n')
-            if ln.strip() and TIMESTAMP_RE.match(ln):
-                logs.append((i, ln))
+    # 1) Load+group logs
+    raw=[]
+    with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
+        for i,line in enumerate(f,1):
+            txt=line.rstrip("\n")
+            if txt.strip(): raw.append((i,txt))
 
-    total_logs = len(logs)
-    parsed = []
-    errors = []
-
-    for line_no, line in tqdm(logs, desc="Parsing logs"):
-        # try each parser in order
-        for parser, t in [(parse_type_a,'A'),
-                          (parse_type_b,'B'),
-                          (parse_type_c,'C')]:
-            try:
-                data = parser(line)
-                log_type = t
-                break
-            except:
-                continue
+    logs=[]
+    curr=None
+    for ln,txt in raw:
+        if TIMESTAMP_RE.match(txt):
+            curr={"start":ln,"lines":[(ln,txt)]}
+            logs.append(curr)
         else:
-            errors.append({"line_no":line_no,"raw":line,"error":"No parser matched"})
-            continue
+            if curr: curr["lines"].append((ln,txt))
 
-        # mobile scan; skip raw payload_i & metadata_i in B
-        for fld, val in data.items():
-            if log_type=='B' and ((fld.startswith("payload_") and "." not in fld)
-                                  or fld.startswith("metadata_")):
+    total_logs=len(logs)
+    parsed,errors=[],[]
+
+    # 2) Parse+mobile-scan
+    for rec in tqdm(logs,desc="Parsing logs"):
+        ln0=rec["start"]
+        text_single="\n".join(l for _,l in rec["lines"])
+        parsed_data,type_ = None,None
+        # A
+        try:
+            parsed_data=parse_type_a(text_single)
+            type_='A'
+        except:
+            # B if ~#~
+            if any("~#~" in l for _,l in rec["lines"]):
+                try:
+                    parsed_data=parse_type_b(rec["lines"])
+                    type_='B'
+                except Exception as e:
+                    errors.append({"line_no":ln0,"raw":text_single,"error":f"B:{e}"})
+                    continue
+            # C if UKC:
+            elif "UKC:" in text_single:
+                try:
+                    parsed_data=parse_type_c(text_single)
+                    type_='C'
+                except Exception as e:
+                    errors.append({"line_no":ln0,"raw":text_single,"error":f"C:{e}"})
+                    continue
+            else:
+                errors.append({"line_no":ln0,"raw":text_single,"error":"No parser"})
+                continue
+
+        # mobile scanning
+        for fld,val in parsed_data.items():
+            if type_=='B' and ((fld.startswith("payload_") and "." not in fld)
+                               or fld.startswith("metadata_")):
                 continue
             for m in MOBILE_REGEX.finditer(str(val)):
                 parsed.append({
-                    "line_no":  line_no,
-                    "type":     log_type,
-                    **data,
-                    "match":    m.group(1),
-                    "field":    fld
+                    "line_no":ln0,
+                    "type":type_,
+                    **parsed_data,
+                    "match":m.group(1),
+                    "field":fld
                 })
 
-    # Write Excel
-    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
-    ws1 = wb.add_worksheet("ParsedLogs")
+    # 3) Write Excel
+    wb=xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws1=wb.add_worksheet("ParsedLogs")
     if parsed:
-        hdrs = list(parsed[0].keys())
-        for c, h in enumerate(hdrs):
-            ws1.write(0, c, h)
-        red = wb.add_format({"font_color":"red"})
-        for r, row in enumerate(parsed, start=1):
-            for c, h in enumerate(hdrs):
-                v = row.get(h,"")
-                ws1.write(r, c, v, red if h=="match" else None)
-    ws2 = wb.add_worksheet("Errors")
+        hdrs=list(parsed[0].keys())
+        for c,h in enumerate(hdrs): ws1.write(0,c,h)
+        red=wb.add_format({"font_color":"red"})
+        for r,row in enumerate(parsed,1):
+            for c,h in enumerate(hdrs):
+                ws1.write(r,c,row.get(h,""), red if h=="match" else None)
+    ws2=wb.add_worksheet("Errors")
     ws2.write_row(0,0,["line_no","raw","error"])
-    for r, e in enumerate(errors, start=1):
-        ws2.write(r,0,e["line_no"])
-        ws2.write(r,1,e["raw"])
-        ws2.write(r,2,e["error"])
+    for r,e in enumerate(errors,1):
+        ws2.write(r,0,e["line_no"]); ws2.write(r,1,e["raw"]); ws2.write(r,2,e["error"])
     wb.close()
 
-    # Write Word
-    doc = Document()
-    for row in tqdm(parsed, desc="Generating Word"):
-        p = doc.add_paragraph()
+    # 4) Write Word
+    doc=Document()
+    for row in tqdm(parsed,desc="Generating Word"):
+        p=doc.add_paragraph()
         p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
-        run = p.add_run(row['match']); run.font.color.rgb = RGBColor(255,0,0)
+        mrun=p.add_run(row['match']); mrun.font.color.rgb=RGBColor(255,0,0)
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # summary
+    # 5) Summary
     print(f"Total logs           : {total_logs}")
     print(f"Total mobile matches : {len(parsed)}")
     print(f"Parse errors         : {len(errors)}")
