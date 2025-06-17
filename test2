@@ -12,11 +12,9 @@ OUTPUT_XLSX = "ParsedLogs_Mobile.xlsx"
 OUTPUT_DOCX = "ParsedLogs_Mobile.docx"
 
 # Mobile regex: no letter/digit immediately before/after
-MOBILE_INNER = r'(?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9}'
-MOBILE_REGEX = re.compile(rf'(?<![A-Za-z0-9])({MOBILE_INNER})(?![A-Za-z0-9])')
-
-# KV‐pattern for key=value mobiles inside fragments
-KV_REGEX = re.compile(rf'([A-Za-z0-9_]+)\s*=\s*{MOBILE_REGEX.pattern}')
+MOBILE_REGEX = re.compile(
+    r'(?<![A-Za-z0-9])((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})(?![A-Za-z0-9])'
+)
 
 # Header: timestamp, thread, level, skip extras, logger
 HEADER_RE = re.compile(
@@ -43,6 +41,9 @@ def flatten_json(obj, prefix=""):
     return out
 
 def extract_fragments(s):
+    """
+    Return list of (frag_text) for each balanced {…} in s.
+    """
     frags = []
     pos = 0
     while True:
@@ -66,7 +67,7 @@ def extract_fragments(s):
     return frags
 
 def main():
-    # Read nonblank lines
+    # 1) Read non-blank lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -77,6 +78,7 @@ def main():
     parsed = []
     errors = []
 
+    # 2) Process each line
     for ln_no, line in tqdm(lines, desc="Parsing lines"):
         m = HEADER_RE.match(line)
         if not m:
@@ -85,40 +87,48 @@ def main():
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # Extract JSON‐style fragments (balanced braces)
+        # 3) Extract each {...} fragment
         for frag in extract_fragments(rest):
-            # 1) JSON parsing & leaf scanning
+            # 3a) Try JSON flattening
+            leaves = {}
             try:
                 obj = json.loads(frag)
                 leaves = flatten_json(obj)
-                for path, val in leaves.items():
-                    for mo in MOBILE_REGEX.finditer(str(val)):
+            except json.JSONDecodeError:
+                pass
+
+            # 3b) For every mobile in the raw fragment
+            for mo in MOBILE_REGEX.finditer(frag):
+                num = mo.group(1)
+                # if any leaf contains this number, emit for each path
+                matched = [path for path, val in leaves.items() if str(val).find(num) != -1]
+                if matched:
+                    for field in matched:
                         parsed.append({
                             "line_no":   ln_no,
                             "timestamp": hdr["timestamp"],
                             "thread":    hdr["thread"],
                             "level":     hdr["level"],
                             "logger":    hdr["logger"],
-                            "field":     path,
-                            "match":     mo.group(1)
+                            "field":     field,
+                            "match":     num
                         })
-            except json.JSONDecodeError:
-                pass
+                else:
+                    # dynamic key= lookup within fragment text
+                    prefix = frag[:mo.start()]
+                    km = re.search(r'([A-Za-z0-9_]+)\s*=\s*[^,]*$', prefix)
+                    field = km.group(1) if km else "fragment"
+                    parsed.append({
+                        "line_no":   ln_no,
+                        "timestamp": hdr["timestamp"],
+                        "thread":    hdr["thread"],
+                        "level":     hdr["level"],
+                        "logger":    hdr["logger"],
+                        "field":     field,
+                        "match":     num
+                    })
 
-            # 2) KV‐style key=value scanning
-            for km in KV_REGEX.finditer(frag):
-                key, num = km.group(1), km.group(2)
-                parsed.append({
-                    "line_no":   ln_no,
-                    "timestamp": hdr["timestamp"],
-                    "thread":    hdr["thread"],
-                    "level":     hdr["level"],
-                    "logger":    hdr["logger"],
-                    "field":     key,
-                    "match":     num
-                })
-
-    # Write Excel
+    # 4) Write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
@@ -131,14 +141,14 @@ def main():
                 ws1.write(r, c, row[h], red if h == "match" else None)
 
     ws2 = wb.add_worksheet("Errors")
-    ws2.write_row(0, 0, ["line_no", "raw", "error"])
+    ws2.write_row(0, 0, ["line_no","raw","error"])
     for r, e in enumerate(errors, 1):
         ws2.write(r, 0, e["line_no"])
         ws2.write(r, 1, e["raw"])
         ws2.write(r, 2, e["error"])
     wb.close()
 
-    # Write Word
+    # 5) Write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
