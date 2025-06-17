@@ -12,13 +12,13 @@ OUTPUT_XLSX = "ParsedLogs_Mobile.xlsx"
 OUTPUT_DOCX = "ParsedLogs_Mobile.docx"
 
 # Mobile regex: no letter/digit immediately before/after
-MOBILE_REGEX = re.compile(
-    r'(?<![A-Za-z0-9])'
-    r'((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})'
-    r'(?![A-Za-z0-9])'
-)
+MOBILE_INNER = r'(?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9}'
+MOBILE_REGEX = re.compile(rf'(?<![A-Za-z0-9])({MOBILE_INNER})(?![A-Za-z0-9])')
 
-# Header: timestamp, thread, level, optional extra brackets, logger
+# KV‐pattern for key=value mobiles inside fragments
+KV_REGEX = re.compile(rf'([A-Za-z0-9_]+)\s*=\s*{MOBILE_REGEX.pattern}')
+
+# Header: timestamp, thread, level, skip extras, logger
 HEADER_RE = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
     r'\[(?P<thread>[^\]]+)\]\s+'
@@ -28,27 +28,23 @@ HEADER_RE = re.compile(
     r'(?P<rest>.+)$'
 )
 
-def flatten_json(o, prefix=""):
+def flatten_json(obj, prefix=""):
     out = {}
-    if isinstance(o, dict):
-        for k, v in o.items():
+    if isinstance(obj, dict):
+        for k, v in obj.items():
             path = f"{prefix}{k}"
             if isinstance(v, (dict, list)):
                 out.update(flatten_json(v, path + "."))
             else:
                 out[path] = v
-    elif isinstance(o, list):
-        for i, item in enumerate(o):
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
             out.update(flatten_json(item, f"{prefix}[{i}]."))
     return out
 
 def extract_fragments(s):
-    """
-    Return list of (json_text, start, end) for every balanced {...} in s.
-    """
     frags = []
     pos = 0
-    L = len(s)
     while True:
         start = s.find("{", pos)
         if start < 0:
@@ -65,12 +61,12 @@ def extract_fragments(s):
                     break
         if depth != 0:
             break
-        frags.append((s[start:end], start, end))
+        frags.append(s[start:end])
         pos = end
     return frags
 
 def main():
-    # read lines
+    # Read nonblank lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -86,90 +82,43 @@ def main():
         if not m:
             errors.append({"line_no": ln_no, "raw": line, "error": "Header parse failed"})
             continue
-
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # extract JSON fragments
-        frags = extract_fragments(rest)
-        seen_positions = set()
-
-        # 1) JSON fragment scanning
-        for frag_text, start, end in frags:
-            # flatten leaves if parseable
-            leaves = {}
+        # Extract JSON‐style fragments (balanced braces)
+        for frag in extract_fragments(rest):
+            # 1) JSON parsing & leaf scanning
             try:
-                obj = json.loads(frag_text)
+                obj = json.loads(frag)
                 leaves = flatten_json(obj)
-            except json.JSONDecodeError:
-                pass
-
-            # scan frag_text for mobiles
-            for mo in MOBILE_REGEX.finditer(frag_text):
-                num = mo.group(1)
-                global_pos = start + mo.start()
-                if global_pos in seen_positions:
-                    continue
-                seen_positions.add(global_pos)
-
-                # find all leaf-paths containing this number
-                paths = [p for p, v in leaves.items() if str(v).find(num) != -1]
-                if paths:
-                    for field in paths:
+                for path, val in leaves.items():
+                    for mo in MOBILE_REGEX.finditer(str(val)):
                         parsed.append({
-                            "line_no":  ln_no,
+                            "line_no":   ln_no,
                             "timestamp": hdr["timestamp"],
                             "thread":    hdr["thread"],
                             "level":     hdr["level"],
                             "logger":    hdr["logger"],
-                            "field":     field,
-                            "match":     num
+                            "field":     path,
+                            "match":     mo.group(1)
                         })
-                else:
-                    # fallback: treat whole fragment as field
-                    parsed.append({
-                        "line_no":  ln_no,
-                        "timestamp": hdr["timestamp"],
-                        "thread":    hdr["thread"],
-                        "level":     hdr["level"],
-                        "logger":    hdr["logger"],
-                        "field":     "fragment",
-                        "match":     num
-                    })
+            except json.JSONDecodeError:
+                pass
 
-        # 2) Fallback scan in the rest (outside fragments)
-        # build intervals of JSON fragments
-        intervals = [(st, en) for _, st, en in frags]
-        for mo in MOBILE_REGEX.finditer(rest):
-            num = mo.group(1)
-            pos = mo.start()
-            if any(st <= pos < en for st, en in intervals):
-                continue
-            # dynamic key lookup: find nearest '=' to left
-            eq = rest.rfind("=", 0, pos)
-            if eq >= 0:
-                left = rest[:eq].rstrip()
-                km = re.search(r'([A-Za-z0-9_]+)$', left)
-                field = km.group(1) if km else "message"
-            else:
-                field = "message"
+            # 2) KV‐style key=value scanning
+            for km in KV_REGEX.finditer(frag):
+                key, num = km.group(1), km.group(2)
+                parsed.append({
+                    "line_no":   ln_no,
+                    "timestamp": hdr["timestamp"],
+                    "thread":    hdr["thread"],
+                    "level":     hdr["level"],
+                    "logger":    hdr["logger"],
+                    "field":     key,
+                    "match":     num
+                })
 
-            global_pos = pos
-            if global_pos in seen_positions:
-                continue
-            seen_positions.add(global_pos)
-
-            parsed.append({
-                "line_no":   ln_no,
-                "timestamp": hdr["timestamp"],
-                "thread":    hdr["thread"],
-                "level":     hdr["level"],
-                "logger":    hdr["logger"],
-                "field":     field,
-                "match":     num
-            })
-
-    # write Excel
+    # Write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
@@ -189,7 +138,7 @@ def main():
         ws2.write(r, 2, e["error"])
     wb.close()
 
-    # write Word
+    # Write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
@@ -199,7 +148,7 @@ def main():
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # summary
+    # Summary
     print(f"Total lines           : {len(lines)}")
     print(f"Total mobile matches  : {len(parsed)}")
     print(f"Header parse failures : {len(errors)}")
