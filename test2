@@ -7,79 +7,51 @@ from docx import Document
 from docx.shared import RGBColor
 
 # === CONFIG ===
-INPUT_FILE   = "input.txt"
-OUTPUT_XLSX  = "ParsedLogs_UPI.xlsx"
-OUTPUT_DOCX  = "ParsedLogs_UPI.docx"
+INPUT_FILE    = "input.txt"
+OUTPUT_XLSX   = "ParsedLogs_Mobile.xlsx"
+OUTPUT_DOCX   = "ParsedLogs_Mobile.docx"
 
-# UPI regex: no word‐char immediately before/after
-UPI_REGEX = re.compile(
-    r'(?<!\w)'
-    r'([A-Za-z0-9.\-_]{2,256}@[A-Za-z]{2,64})'
-    r'(?![\w\.])'
+# Mobile regex: no letter/digit immediately before/after
+MOBILE_REGEX = re.compile(
+    r'(?<![A-Za-z0-9])'
+    r'((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})'
+    r'(?![A-Za-z0-9])'
 )
 
-# Timestamp detection (with optional ms)
-TIMESTAMP_RE = re.compile(
-    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\s'
-)
-
-# Header regex for Type B
-HEADER_B_RE = re.compile(
-    r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
+# Timestamp + header brackets: timestamp, thread, level, logger
+HEADER_RE = re.compile(
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
     r'\[(?P<thread>[^\]]+)\]\s+'
     r'\[(?P<level>\w+)\s*\]\s+'
-    r'\[(?P<logger>[^\]]+)\]\s*-\s*'
-    r'(?P<rest>.+)$'
+    r'\[(?P<logger>[^\]]+)\]\s*-\s*(?P<rest>.+)$'
 )
 
-def detect_type(line):
-    if ' cid=[' in line and ' txn=[' in line:
-        return 'A'
-    if '~#~' in line:
-        return 'B'
-    if 'UKC:' in line:
-        return 'C'
-    return None
+def flatten_json(obj, prefix=""):
+    out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                out.update(flatten_json(v, key + "."))
+            else:
+                out[key] = v
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            out.update(flatten_json(item, f"{prefix}[{i}]."))
+    return out
 
-def parse_type_a(line):
-    m = re.match(
-        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+'
-        r'(?P<level>\w+)\s+\[(?P<thread>[^\]]+)\]\s+'
-        r'cid=\[(?P<cid>[^\]]*)\]\s+'
-        r'txn=\[(?P<txn>[^\]]*)\]\s+'
-        r'(?P<logger>\w+)\s*:\s*(?P<message>.+)$',
-        line
-    )
-    if not m:
-        raise ValueError("Type A parse error")
-    return m.groupdict()
-
-def parse_type_b(line):
-    mb = HEADER_B_RE.match(line)
-    if not mb:
-        raise ValueError("Type B header parse failed")
-    hdr = mb.groupdict()
-    rest = hdr.pop("rest")
-
-    segments = []
+def extract_json_fragments(s):
+    """Return list of (json_text, parse_error_flag) from all {...} fragments in s."""
+    fragments = []
     pos = 0
+    L = len(s)
     while True:
-        start = rest.find("{", pos)
-        if start == -1:
-            tail = rest[pos:].strip()
-            if tail:
-                segments.append(("metadata", tail))
+        start = s.find("{", pos)
+        if start < 0:
             break
-
-        if start > pos:
-            meta = rest[pos:start].strip()
-            if meta:
-                segments.append(("metadata", meta))
-
-        # attempt brace matching
         depth = 0
         end = start
-        for i, ch in enumerate(rest[start:], start):
+        for i, ch in enumerate(s[start:], start):
             if ch == "{":
                 depth += 1
             elif ch == "}":
@@ -87,145 +59,98 @@ def parse_type_b(line):
                 if depth == 0:
                     end = i
                     break
-
-        # if braces never closed, capture to end and note parse_error
+        # if unclosed, take rest of line and mark error
         if depth != 0:
-            payload = rest[start:].strip()
-            segments.append(("payload", payload))
-            segments.append(("parse_error", "incomplete JSON"))
-            pos = len(rest)
+            fragments.append((s[start:].strip(), True))
             break
-
-        payload = rest[start:end+1]
-        segments.append(("payload", payload))
+        fragments.append((s[start:end+1], False))
         pos = end + 1
-
-    rec = {
-        "timestamp": hdr["timestamp"],
-        "thread":    hdr["thread"],
-        "level":     hdr["level"],
-        "logger":    hdr["logger"],
-    }
-
-    meta_i = pay_i = 0
-    for kind, txt in segments:
-        if kind == "metadata":
-            rec[f"metadata_{meta_i}"] = txt
-            meta_i += 1
-        elif kind == "payload":
-            rec[f"payload_{pay_i}"] = txt
-            pay_i += 1
-        elif kind == "parse_error":
-            rec[f"payload_{pay_i-1}.parse_error"] = txt
-
-    return rec
-
-def parse_type_c(line):
-    m = re.match(
-        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
-        r'\[(?P<thread>[^\]]+)\]\s+'
-        r'\[(?P<level>\w+)\s*\]\s+'
-        r'\[(?P<logger>[^\]]+)\]\s*-\s*(?P<rest>.+)$',
-        line
-    )
-    if not m:
-        raise ValueError("Type C parse error")
-    info = m.groupdict()
-    parts = [p.strip() for p in info["rest"].split(",")]
-    return {
-        "timestamp":     info["timestamp"],
-        "thread":        info["thread"],
-        "level":         info["level"],
-        "logger":        info["logger"],
-        "ukc":           parts[0].split(":",1)[1] if ":" in parts[0] else parts[0],
-        "request_time":  parts[1] if len(parts)>1 else "",
-        "response_time": parts[2] if len(parts)>2 else "",
-        "masked_id":     parts[3] if len(parts)>3 else "",
-        "operation":     parts[4] if len(parts)>4 else "",
-        "other":         ",".join(parts[5:]) if len(parts)>5 else ""
-    }
+    return fragments
 
 def main():
-    # read all nonblank lines
+    # 1) Read lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
-        for ln_no, raw in enumerate(f, start=1):
+        for ln_no, raw in enumerate(f, 1):
             txt = raw.rstrip("\n")
             if txt.strip():
                 lines.append((ln_no, txt))
 
-    # filter logs by timestamp
-    logs = [(ln_no, txt) for ln_no, txt in lines if TIMESTAMP_RE.match(txt)]
-    total_logs = len(logs)
-
+    # 2) Parse each line
     parsed = []
     errors = []
-
-    for ln_no, line in tqdm(logs, desc="Parsing logs"):
-        t = detect_type(line)
-        try:
-            if t == "A":
-                data = parse_type_a(line)
-            elif t == "B":
-                data = parse_type_b(line)
-            elif t == "C":
-                data = parse_type_c(line)
-            else:
-                raise ValueError("Unknown log type")
-        except Exception as e:
-            errors.append({
-                "line_no": ln_no,
-                "raw": line,
-                "error": str(e)
-            })
+    for ln_no, line in tqdm(lines, desc="Parsing lines"):
+        m = HEADER_RE.match(line)
+        if not m:
+            errors.append({"line_no": ln_no, "raw": line, "error": "Header parse failed"})
             continue
 
-        # scan for UPI IDs in every field value
-        for field, val in data.items():
-            for m in UPI_REGEX.finditer(str(val)):
+        hdr = m.groupdict()
+        rest = hdr.pop("rest")
+
+        # 3) Extract JSON fragments
+        frags = extract_json_fragments(rest)
+        # 4) For each fragment, flatten if valid JSON
+        flat = {}
+        for idx, (js, bad) in enumerate(frags):
+            key_base = f"payload_{idx}"
+            flat[f"{key_base}"] = js
+            if bad:
+                flat[f"{key_base}.parse_error"] = "unclosed JSON"
+                continue
+            try:
+                obj = json.loads(js)
+                for k, v in flatten_json(obj).items():
+                    flat[f"{key_base}.{k}"] = v
+            except json.JSONDecodeError:
+                flat[f"{key_base}.parse_error"] = "invalid JSON"
+
+        # 5) Scan every flattened value for mobiles
+        for field, val in flat.items():
+            for mo in MOBILE_REGEX.finditer(str(val)):
                 parsed.append({
-                    "line_no": ln_no,
-                    "type":    t,
-                    **data,
-                    "match":   m.group(1),
-                    "field":   field
+                    "line_no":  ln_no,
+                    **hdr,
+                    "field":    field,
+                    "match":    mo.group(1)
                 })
 
-    # write Excel
+    # 6) Write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
-    ws1 = wb.add_worksheet("ParsedLogs")
+    ws = wb.add_worksheet("ParsedLogs")
     if parsed:
         headers = list(parsed[0].keys())
         for c, h in enumerate(headers):
-            ws1.write(0, c, h)
+            ws.write(0, c, h)
         red = wb.add_format({"font_color": "red"})
-        for r, row in enumerate(parsed, start=1):
+        for r, row in enumerate(parsed, 1):
             for c, h in enumerate(headers):
-                ws1.write(r, c, row.get(h, ""), red if h == "match" else None)
+                val = row.get(h, "")
+                ws.write(r, c, val, red if h == "match" else None)
 
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0, 0, ["line_no", "raw", "error"])
-    for r, err in enumerate(errors, start=1):
-        ws2.write(r, 0, err["line_no"])
-        ws2.write(r, 1, err["raw"])
-        ws2.write(r, 2, err["error"])
+    for r, e in enumerate(errors, 1):
+        ws2.write(r, 0, e["line_no"])
+        ws2.write(r, 1, e["raw"])
+        ws2.write(r, 2, e["error"])
 
     wb.close()
 
-    # write Word
+    # 7) Write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
         p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
-        mrun = p.add_run(row["match"])
-        mrun.font.color.rgb = RGBColor(255, 0, 0)
+        run = p.add_run(row["match"])
+        run.font.color.rgb = RGBColor(255, 0, 0)
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # summary
-    print(f"Total logs        : {total_logs}")
-    print(f"Total UPI matches : {len(parsed)}")
-    print(f"Parse errors      : {len(errors)}")
+    # 8) Summary
+    print(f"Total lines           : {len(lines)}")
+    print(f"Total mobile matches  : {len(parsed)}")
+    print(f"Header parse failures : {len(errors)}")
 
 if __name__ == "__main__":
     main()
