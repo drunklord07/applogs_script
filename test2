@@ -7,9 +7,9 @@ from docx import Document
 from docx.shared import RGBColor
 
 # === CONFIG ===
-INPUT_FILE    = "input.txt"
-OUTPUT_XLSX   = "ParsedLogs_Mobile.xlsx"
-OUTPUT_DOCX   = "ParsedLogs_Mobile.docx"
+INPUT_FILE  = "input.txt"
+OUTPUT_XLSX = "ParsedLogs_Mobile.xlsx"
+OUTPUT_DOCX = "ParsedLogs_Mobile.docx"
 
 # Mobile regex: no letter/digit immediately before/after
 MOBILE_REGEX = re.compile(
@@ -18,7 +18,7 @@ MOBILE_REGEX = re.compile(
     r'(?![A-Za-z0-9])'
 )
 
-# Flexible header: timestamp, thread, level, skip extras, logger
+# Header: timestamp, thread, level, optional extra brackets, logger
 HEADER_RE = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
     r'\[(?P<thread>[^\]]+)\]\s+'
@@ -28,26 +28,30 @@ HEADER_RE = re.compile(
     r'(?P<rest>.+)$'
 )
 
-def flatten_json(obj, prefix=""):
+def flatten_json(o, prefix=""):
     out = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
+    if isinstance(o, dict):
+        for k, v in o.items():
             path = f"{prefix}{k}"
             if isinstance(v, (dict, list)):
                 out.update(flatten_json(v, path + "."))
             else:
                 out[path] = v
-    elif isinstance(obj, list):
-        for i, item in enumerate(obj):
+    elif isinstance(o, list):
+        for i, item in enumerate(o):
             out.update(flatten_json(item, f"{prefix}[{i}]."))
     return out
 
-def extract_json_fragments(s):
+def extract_fragments(s):
+    """
+    Return list of (json_text, start, end) for every balanced {...} in s.
+    """
     frags = []
     pos = 0
+    L = len(s)
     while True:
         start = s.find("{", pos)
-        if start == -1:
+        if start < 0:
             break
         depth = 0
         end = start
@@ -57,16 +61,16 @@ def extract_json_fragments(s):
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    end = i
+                    end = i + 1
                     break
         if depth != 0:
             break
-        frags.append(s[start:end+1])
-        pos = end + 1
+        frags.append((s[start:end], start, end))
+        pos = end
     return frags
 
 def main():
-    # 1) Read nonblank lines
+    # read lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -77,7 +81,6 @@ def main():
     parsed = []
     errors = []
 
-    # 2) Process each line
     for ln_no, line in tqdm(lines, desc="Parsing lines"):
         m = HEADER_RE.match(line)
         if not m:
@@ -87,26 +90,32 @@ def main():
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # 3) Extract JSON fragments
-        frags = extract_json_fragments(rest)
+        # extract JSON fragments
+        frags = extract_fragments(rest)
+        seen_positions = set()
 
-        # 4) For each fragment: flatten leaves and scan raw fragment
-        for idx, frag in enumerate(frags):
-            # flatten JSON leaves if parseable
+        # 1) JSON fragment scanning
+        for frag_text, start, end in frags:
+            # flatten leaves if parseable
             leaves = {}
             try:
-                obj = json.loads(frag)
+                obj = json.loads(frag_text)
                 leaves = flatten_json(obj)
             except json.JSONDecodeError:
-                pass  # we'll still scan raw fragment below
+                pass
 
-            # 5) Scan the raw fragment for every mobile match
-            for mo in MOBILE_REGEX.finditer(frag):
+            # scan frag_text for mobiles
+            for mo in MOBILE_REGEX.finditer(frag_text):
                 num = mo.group(1)
-                # find all leaf paths containing this number
-                matched_paths = [path for path, val in leaves.items() if str(val).find(num) != -1]
-                if matched_paths:
-                    for field in matched_paths:
+                global_pos = start + mo.start()
+                if global_pos in seen_positions:
+                    continue
+                seen_positions.add(global_pos)
+
+                # find all leaf-paths containing this number
+                paths = [p for p, v in leaves.items() if str(v).find(num) != -1]
+                if paths:
+                    for field in paths:
                         parsed.append({
                             "line_no":  ln_no,
                             "timestamp": hdr["timestamp"],
@@ -117,28 +126,60 @@ def main():
                             "match":     num
                         })
                 else:
-                    # fallback if no leaf path: use fragment index
+                    # fallback: treat whole fragment as field
                     parsed.append({
                         "line_no":  ln_no,
                         "timestamp": hdr["timestamp"],
                         "thread":    hdr["thread"],
                         "level":     hdr["level"],
                         "logger":    hdr["logger"],
-                        "field":     f"fragment_{idx}",
+                        "field":     "fragment",
                         "match":     num
                     })
 
-    # 6) Write Excel
+        # 2) Fallback scan in the rest (outside fragments)
+        # build intervals of JSON fragments
+        intervals = [(st, en) for _, st, en in frags]
+        for mo in MOBILE_REGEX.finditer(rest):
+            num = mo.group(1)
+            pos = mo.start()
+            if any(st <= pos < en for st, en in intervals):
+                continue
+            # dynamic key lookup: find nearest '=' to left
+            eq = rest.rfind("=", 0, pos)
+            if eq >= 0:
+                left = rest[:eq].rstrip()
+                km = re.search(r'([A-Za-z0-9_]+)$', left)
+                field = km.group(1) if km else "message"
+            else:
+                field = "message"
+
+            global_pos = pos
+            if global_pos in seen_positions:
+                continue
+            seen_positions.add(global_pos)
+
+            parsed.append({
+                "line_no":   ln_no,
+                "timestamp": hdr["timestamp"],
+                "thread":    hdr["thread"],
+                "level":     hdr["level"],
+                "logger":    hdr["logger"],
+                "field":     field,
+                "match":     num
+            })
+
+    # write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
-        headers = list(parsed[0].keys())
-        for c, h in enumerate(headers):
+        cols = list(parsed[0].keys())
+        for c, h in enumerate(cols):
             ws1.write(0, c, h)
         red = wb.add_format({"font_color": "red"})
         for r, row in enumerate(parsed, 1):
-            for c, h in enumerate(headers):
-                ws1.write(r, c, row.get(h, ""), red if h == "match" else None)
+            for c, h in enumerate(cols):
+                ws1.write(r, c, row[h], red if h == "match" else None)
 
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0, 0, ["line_no", "raw", "error"])
@@ -148,7 +189,7 @@ def main():
         ws2.write(r, 2, e["error"])
     wb.close()
 
-    # 7) Write Word
+    # write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
@@ -158,7 +199,7 @@ def main():
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # 8) Summary
+    # summary
     print(f"Total lines           : {len(lines)}")
     print(f"Total mobile matches  : {len(parsed)}")
     print(f"Header parse failures : {len(errors)}")
