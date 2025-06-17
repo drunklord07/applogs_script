@@ -18,36 +18,36 @@ MOBILE_REGEX = re.compile(
     r'(?![A-Za-z0-9])'
 )
 
-# Flexible header: timestamp, thread, level, (skip any extra []), logger
+# Flexible header: timestamp, thread, level, skip extras, logger
 HEADER_RE = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
     r'\[(?P<thread>[^\]]+)\]\s+'
     r'\[(?P<level>[^\]]+)\]\s+'
-    r'(?:\[[^\]]*\]\s+)*'                # skip any extra bracketed sections
+    r'(?:\[[^\]]*\]\s+)*'
     r'\[(?P<logger>[^\]]+)\]\s*-\s*'
     r'(?P<rest>.+)$'
 )
 
-def flatten_json(obj, prefix=""):
+def flatten_json(o, prefix=""):
     out = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = f"{prefix}{k}"
+    if isinstance(o, dict):
+        for k, v in o.items():
+            path = f"{prefix}{k}"
             if isinstance(v, (dict, list)):
-                out.update(flatten_json(v, key + "."))
+                out.update(flatten_json(v, path + "."))
             else:
-                out[key] = v
-    elif isinstance(obj, list):
-        for i, item in enumerate(obj):
+                out[path] = v
+    elif isinstance(o, list):
+        for i, item in enumerate(o):
             out.update(flatten_json(item, f"{prefix}[{i}]."))
     return out
 
 def extract_json_fragments(s):
-    fragments = []
+    frags = []
     pos = 0
     while True:
         start = s.find("{", pos)
-        if start < 0:
+        if start == -1:
             break
         depth = 0
         end = start
@@ -59,16 +59,16 @@ def extract_json_fragments(s):
                 if depth == 0:
                     end = i
                     break
+        # if unclosed
         if depth != 0:
-            # unclosed JSON: capture rest
-            fragments.append((s[start:].strip(), True))
+            frags.append((s[start:].strip(), True))
             break
-        fragments.append((s[start:end+1], False))
+        frags.append((s[start:end+1], False))
         pos = end + 1
-    return fragments
+    return frags
 
 def main():
-    # 1) Read nonblank lines
+    # read nonblank lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -79,7 +79,6 @@ def main():
     parsed = []
     errors = []
 
-    # 2) Process each line
     for ln_no, line in tqdm(lines, desc="Parsing lines"):
         m = HEADER_RE.match(line)
         if not m:
@@ -89,28 +88,33 @@ def main():
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # 3) Extract JSON fragments
-        frags = extract_json_fragments(rest)
-
-        # 4) Flatten each fragment
+        # extract & flatten only leaf JSON values
         flat = {}
-        for idx, (js, bad) in enumerate(frags):
-            base = f"payload_{idx}"
-            flat[base] = js
+        for idx, (js, bad) in enumerate(extract_json_fragments(rest)):
             if bad:
-                flat[f"{base}.parse_error"] = "unclosed JSON"
+                errors.append({
+                    "line_no": ln_no,
+                    "raw": js,
+                    "error": "Unclosed JSON fragment"
+                })
                 continue
             try:
                 obj = json.loads(js)
-                flat.update({f"{base}.{k}": v for k, v in flatten_json(obj).items()})
+                leaves = flatten_json(obj)
+                for path, val in leaves.items():
+                    flat[f"payload_{idx}.{path}"] = val
             except json.JSONDecodeError:
-                flat[f"{base}.parse_error"] = "invalid JSON"
+                errors.append({
+                    "line_no": ln_no,
+                    "raw": js,
+                    "error": "Invalid JSON fragment"
+                })
 
-        # 5) Scan for mobiles
+        # scan only those leaf values
         for field, val in flat.items():
             for mo in MOBILE_REGEX.finditer(str(val)):
                 parsed.append({
-                    "line_no":  ln_no,
+                    "line_no":   ln_no,
                     "timestamp": hdr["timestamp"],
                     "thread":    hdr["thread"],
                     "level":     hdr["level"],
@@ -119,7 +123,7 @@ def main():
                     "match":     mo.group(1)
                 })
 
-    # 6) Write Excel
+    # write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
@@ -129,8 +133,7 @@ def main():
         red = wb.add_format({"font_color": "red"})
         for r, row in enumerate(parsed, 1):
             for c, h in enumerate(headers):
-                val = row.get(h, "")
-                ws1.write(r, c, val, red if h == "match" else None)
+                ws1.write(r, c, row.get(h, ""), red if h == "match" else None)
 
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0, 0, ["line_no", "raw", "error"])
@@ -140,7 +143,7 @@ def main():
         ws2.write(r, 2, e["error"])
     wb.close()
 
-    # 7) Write Word
+    # write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
@@ -150,10 +153,9 @@ def main():
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # 8) Summary
-    print(f"Total lines            : {len(lines)}")
-    print(f"Total mobile matches   : {len(parsed)}")
-    print(f"Header parse failures  : {len(errors)}")
+    print(f"Total lines           : {len(lines)}")
+    print(f"Total mobile matches  : {len(parsed)}")
+    print(f"Header parse failures : {len(errors)}")
 
 if __name__ == "__main__":
     main()
