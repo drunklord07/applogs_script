@@ -60,14 +60,13 @@ def extract_json_fragments(s):
                     end = i
                     break
         if depth != 0:
-            # unclosed JSON: skip it
-            break
+            break  # skip unclosed
         frags.append(s[start:end+1])
         pos = end + 1
     return frags
 
 def main():
-    # read nonblank lines
+    # Read non-blank lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -83,34 +82,35 @@ def main():
         if not m:
             errors.append({"line_no": ln_no, "raw": line, "error": "Header parse failed"})
             continue
-
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # extract JSON fragments, flatten leaves without any payload_i prefix
-        leaves = {}
-        for js in extract_json_fragments(rest):
+        # Extract and parse each JSON fragment
+        for frag in extract_json_fragments(rest):
             try:
-                obj = json.loads(js)
-                leaves.update(flatten_json(obj))
+                obj = json.loads(frag)
             except json.JSONDecodeError:
-                # skip malformed JSON silently
                 continue
+            leaves = flatten_json(obj)
+            # Find all mobiles in raw fragment
+            for mo in MOBILE_REGEX.finditer(frag):
+                num = mo.group(1)
+                # Find which leaf(s) contain this number
+                matched = [path for path, val in leaves.items() if str(val).find(num) != -1]
+                if not matched:
+                    continue
+                for field in matched:
+                    parsed.append({
+                        "line_no":  ln_no,
+                        "timestamp": hdr["timestamp"],
+                        "thread":    hdr["thread"],
+                        "level":     hdr["level"],
+                        "logger":    hdr["logger"],
+                        "field":     field,
+                        "match":     num
+                    })
 
-        # scan each leaf value for mobiles
-        for field, val in leaves.items():
-            for mo in MOBILE_REGEX.finditer(str(val)):
-                parsed.append({
-                    "line_no":   ln_no,
-                    "timestamp": hdr["timestamp"],
-                    "thread":    hdr["thread"],
-                    "level":     hdr["level"],
-                    "logger":    hdr["logger"],
-                    "field":     field,
-                    "match":     mo.group(1)
-                })
-
-    # write Excel
+    # Write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
@@ -130,7 +130,7 @@ def main():
         ws2.write(r, 2, e["error"])
     wb.close()
 
-    # write Word
+    # Write Word
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
@@ -140,6 +140,7 @@ def main():
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
+    # Summary
     print(f"Total lines           : {len(lines)}")
     print(f"Total mobile matches  : {len(parsed)}")
     print(f"Header parse failures : {len(errors)}")
