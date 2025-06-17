@@ -18,12 +18,14 @@ MOBILE_REGEX = re.compile(
     r'(?![A-Za-z0-9])'
 )
 
-# Timestamp + header brackets: timestamp, thread, level, logger
+# Flexible header: timestamp, thread, level, (skip any extra []), logger
 HEADER_RE = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
     r'\[(?P<thread>[^\]]+)\]\s+'
-    r'\[(?P<level>\w+)\s*\]\s+'
-    r'\[(?P<logger>[^\]]+)\]\s*-\s*(?P<rest>.+)$'
+    r'\[(?P<level>[^\]]+)\]\s+'
+    r'(?:\[[^\]]*\]\s+)*'                # skip any extra bracketed sections
+    r'\[(?P<logger>[^\]]+)\]\s*-\s*'
+    r'(?P<rest>.+)$'
 )
 
 def flatten_json(obj, prefix=""):
@@ -41,10 +43,8 @@ def flatten_json(obj, prefix=""):
     return out
 
 def extract_json_fragments(s):
-    """Return list of (json_text, parse_error_flag) from all {...} fragments in s."""
     fragments = []
     pos = 0
-    L = len(s)
     while True:
         start = s.find("{", pos)
         if start < 0:
@@ -59,8 +59,8 @@ def extract_json_fragments(s):
                 if depth == 0:
                     end = i
                     break
-        # if unclosed, take rest of line and mark error
         if depth != 0:
+            # unclosed JSON: capture rest
             fragments.append((s[start:].strip(), True))
             break
         fragments.append((s[start:end+1], False))
@@ -68,7 +68,7 @@ def extract_json_fragments(s):
     return fragments
 
 def main():
-    # 1) Read lines
+    # 1) Read nonblank lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -76,9 +76,10 @@ def main():
             if txt.strip():
                 lines.append((ln_no, txt))
 
-    # 2) Parse each line
     parsed = []
     errors = []
+
+    # 2) Process each line
     for ln_no, line in tqdm(lines, desc="Parsing lines"):
         m = HEADER_RE.match(line)
         if not m:
@@ -90,43 +91,46 @@ def main():
 
         # 3) Extract JSON fragments
         frags = extract_json_fragments(rest)
-        # 4) For each fragment, flatten if valid JSON
+
+        # 4) Flatten each fragment
         flat = {}
         for idx, (js, bad) in enumerate(frags):
-            key_base = f"payload_{idx}"
-            flat[f"{key_base}"] = js
+            base = f"payload_{idx}"
+            flat[base] = js
             if bad:
-                flat[f"{key_base}.parse_error"] = "unclosed JSON"
+                flat[f"{base}.parse_error"] = "unclosed JSON"
                 continue
             try:
                 obj = json.loads(js)
-                for k, v in flatten_json(obj).items():
-                    flat[f"{key_base}.{k}"] = v
+                flat.update({f"{base}.{k}": v for k, v in flatten_json(obj).items()})
             except json.JSONDecodeError:
-                flat[f"{key_base}.parse_error"] = "invalid JSON"
+                flat[f"{base}.parse_error"] = "invalid JSON"
 
-        # 5) Scan every flattened value for mobiles
+        # 5) Scan for mobiles
         for field, val in flat.items():
             for mo in MOBILE_REGEX.finditer(str(val)):
                 parsed.append({
                     "line_no":  ln_no,
-                    **hdr,
-                    "field":    field,
-                    "match":    mo.group(1)
+                    "timestamp": hdr["timestamp"],
+                    "thread":    hdr["thread"],
+                    "level":     hdr["level"],
+                    "logger":    hdr["logger"],
+                    "field":     field,
+                    "match":     mo.group(1)
                 })
 
     # 6) Write Excel
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
-    ws = wb.add_worksheet("ParsedLogs")
+    ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
         headers = list(parsed[0].keys())
         for c, h in enumerate(headers):
-            ws.write(0, c, h)
+            ws1.write(0, c, h)
         red = wb.add_format({"font_color": "red"})
         for r, row in enumerate(parsed, 1):
             for c, h in enumerate(headers):
                 val = row.get(h, "")
-                ws.write(r, c, val, red if h == "match" else None)
+                ws1.write(r, c, val, red if h == "match" else None)
 
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0, 0, ["line_no", "raw", "error"])
@@ -134,7 +138,6 @@ def main():
         ws2.write(r, 0, e["line_no"])
         ws2.write(r, 1, e["raw"])
         ws2.write(r, 2, e["error"])
-
     wb.close()
 
     # 7) Write Word
@@ -148,9 +151,9 @@ def main():
     doc.save(OUTPUT_DOCX)
 
     # 8) Summary
-    print(f"Total lines           : {len(lines)}")
-    print(f"Total mobile matches  : {len(parsed)}")
-    print(f"Header parse failures : {len(errors)}")
+    print(f"Total lines            : {len(lines)}")
+    print(f"Total mobile matches   : {len(parsed)}")
+    print(f"Header parse failures  : {len(errors)}")
 
 if __name__ == "__main__":
     main()
