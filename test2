@@ -16,6 +16,9 @@ MOBILE_REGEX = re.compile(
     r'(?<![A-Za-z0-9])((?:\+91[\-\s]?|91[\-\s]?|0)?[6-9]\d{9})(?![A-Za-z0-9])'
 )
 
+# Candidate keys before "="
+KV_CANDIDATE_RE = re.compile(r'\b([A-Za-z0-9_]+)\s*=')
+
 # Header: timestamp, thread, level, skip extras, logger
 HEADER_RE = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
@@ -42,7 +45,7 @@ def flatten_json(obj, prefix=""):
 
 def extract_fragments(s):
     """
-    Return list of (frag_text) for each balanced {…} in s.
+    Return list of each balanced {...} substring in s.
     """
     frags = []
     pos = 0
@@ -52,22 +55,36 @@ def extract_fragments(s):
             break
         depth = 0
         end = start
-        for i, ch in enumerate(s[start:], start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
+        for i,ch in enumerate(s[start:], start):
+            if ch=="{":
+                depth+=1
+            elif ch=="}":
+                depth-=1
+                if depth==0:
+                    end=i+1
                     break
-        if depth != 0:
+        if depth!=0:
             break
         frags.append(s[start:end])
         pos = end
     return frags
 
+def find_nearest_key(frag, match_start):
+    """
+    Look for all 'key=' in frag, pick the one whose '=' is the last
+    before match_start.
+    """
+    candidates = []
+    for m in KV_CANDIDATE_RE.finditer(frag):
+        eq_pos = m.end() - 1  # position of '='
+        if eq_pos < match_start:
+            candidates.append((eq_pos, m.group(1)))
+    if not candidates:
+        return None
+    # pick the candidate with the largest eq_pos
+    return max(candidates)[1]
+
 def main():
-    # 1) Read non-blank lines
     lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
         for ln_no, raw in enumerate(f, 1):
@@ -78,7 +95,6 @@ def main():
     parsed = []
     errors = []
 
-    # 2) Process each line
     for ln_no, line in tqdm(lines, desc="Parsing lines"):
         m = HEADER_RE.match(line)
         if not m:
@@ -87,78 +103,64 @@ def main():
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # 3) Extract each {...} fragment
         for frag in extract_fragments(rest):
-            # 3a) Try JSON flattening
-            leaves = {}
+            # 1) JSON‐leaf matches
             try:
                 obj = json.loads(frag)
                 leaves = flatten_json(obj)
             except json.JSONDecodeError:
-                pass
+                leaves = {}
 
-            # 3b) For every mobile in the raw fragment
+            # 2) Scan raw frag for mobiles
             for mo in MOBILE_REGEX.finditer(frag):
                 num = mo.group(1)
-                # if any leaf contains this number, emit for each path
-                matched = [path for path, val in leaves.items() if str(val).find(num) != -1]
-                if matched:
-                    for field in matched:
-                        parsed.append({
-                            "line_no":   ln_no,
-                            "timestamp": hdr["timestamp"],
-                            "thread":    hdr["thread"],
-                            "level":     hdr["level"],
-                            "logger":    hdr["logger"],
-                            "field":     field,
-                            "match":     num
+                start = mo.start()
+                # first try leaf‐paths
+                paths = [p for p,v in leaves.items() if str(v).find(num) != -1]
+                if paths:
+                    for field in paths:
+                        parsed.append({**hdr,
+                            "line_no": ln_no,
+                            "field":   field,
+                            "match":   num
                         })
                 else:
-                    # dynamic key= lookup within fragment text
-                    prefix = frag[:mo.start()]
-                    km = re.search(r'([A-Za-z0-9_]+)\s*=\s*[^,]*$', prefix)
-                    field = km.group(1) if km else "fragment"
-                    parsed.append({
-                        "line_no":   ln_no,
-                        "timestamp": hdr["timestamp"],
-                        "thread":    hdr["thread"],
-                        "level":     hdr["level"],
-                        "logger":    hdr["logger"],
-                        "field":     field,
-                        "match":     num
+                    # fallback: nearest key=
+                    key = find_nearest_key(frag, start) or "fragment"
+                    parsed.append({**hdr,
+                        "line_no": ln_no,
+                        "field":   key,
+                        "match":   num
                     })
 
-    # 4) Write Excel
+    # Excel output
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws1 = wb.add_worksheet("ParsedLogs")
     if parsed:
         cols = list(parsed[0].keys())
         for c, h in enumerate(cols):
             ws1.write(0, c, h)
-        red = wb.add_format({"font_color": "red"})
+        red = wb.add_format({"font_color":"red"})
         for r, row in enumerate(parsed, 1):
             for c, h in enumerate(cols):
-                ws1.write(r, c, row[h], red if h == "match" else None)
+                ws1.write(r, c, row[h], red if h=="match" else None)
 
     ws2 = wb.add_worksheet("Errors")
     ws2.write_row(0, 0, ["line_no","raw","error"])
-    for r, e in enumerate(errors, 1):
-        ws2.write(r, 0, e["line_no"])
-        ws2.write(r, 1, e["raw"])
-        ws2.write(r, 2, e["error"])
+    for r,e in enumerate(errors, 1):
+        ws2.write(r,0,e["line_no"]); ws2.write(r,1,e["raw"]); ws2.write(r,2,e["error"])
     wb.close()
 
-    # 5) Write Word
+    # Word output
     doc = Document()
     for row in tqdm(parsed, desc="Generating Word"):
         p = doc.add_paragraph()
         p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
         run = p.add_run(row["match"])
-        run.font.color.rgb = RGBColor(255, 0, 0)
+        run.font.color.rgb = RGBColor(255,0,0)
         p.add_run(f" [{row['field']}]")
     doc.save(OUTPUT_DOCX)
 
-    # Summary
     print(f"Total lines           : {len(lines)}")
     print(f"Total mobile matches  : {len(parsed)}")
     print(f"Header parse failures : {len(errors)}")
