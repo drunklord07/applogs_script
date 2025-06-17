@@ -28,17 +28,17 @@ HEADER_RE = re.compile(
     r'(?P<rest>.+)$'
 )
 
-def flatten_json(o, prefix=""):
+def flatten_json(obj, prefix=""):
     out = {}
-    if isinstance(o, dict):
-        for k, v in o.items():
+    if isinstance(obj, dict):
+        for k, v in obj.items():
             path = f"{prefix}{k}"
             if isinstance(v, (dict, list)):
                 out.update(flatten_json(v, path + "."))
             else:
                 out[path] = v
-    elif isinstance(o, list):
-        for i, item in enumerate(o):
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
             out.update(flatten_json(item, f"{prefix}[{i}]."))
     return out
 
@@ -59,11 +59,10 @@ def extract_json_fragments(s):
                 if depth == 0:
                     end = i
                     break
-        # if unclosed
         if depth != 0:
-            frags.append((s[start:].strip(), True))
+            # unclosed JSON: skip it
             break
-        frags.append((s[start:end+1], False))
+        frags.append(s[start:end+1])
         pos = end + 1
     return frags
 
@@ -88,30 +87,18 @@ def main():
         hdr = m.groupdict()
         rest = hdr.pop("rest")
 
-        # extract & flatten only leaf JSON values
-        flat = {}
-        for idx, (js, bad) in enumerate(extract_json_fragments(rest)):
-            if bad:
-                errors.append({
-                    "line_no": ln_no,
-                    "raw": js,
-                    "error": "Unclosed JSON fragment"
-                })
-                continue
+        # extract JSON fragments, flatten leaves without any payload_i prefix
+        leaves = {}
+        for js in extract_json_fragments(rest):
             try:
                 obj = json.loads(js)
-                leaves = flatten_json(obj)
-                for path, val in leaves.items():
-                    flat[f"payload_{idx}.{path}"] = val
+                leaves.update(flatten_json(obj))
             except json.JSONDecodeError:
-                errors.append({
-                    "line_no": ln_no,
-                    "raw": js,
-                    "error": "Invalid JSON fragment"
-                })
+                # skip malformed JSON silently
+                continue
 
-        # scan only those leaf values
-        for field, val in flat.items():
+        # scan each leaf value for mobiles
+        for field, val in leaves.items():
             for mo in MOBILE_REGEX.finditer(str(val)):
                 parsed.append({
                     "line_no":   ln_no,
