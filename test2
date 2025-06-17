@@ -3,12 +3,28 @@ import re
 import json
 import xlsxwriter
 from tqdm import tqdm
+from docx import Document
+from docx.shared import RGBColor
 
-INPUT_FILE  = "input.txt"
-OUTPUT_FILE = "ParsedLogs_Test.xlsx"
+# === CONFIG ===
+INPUT_FILE   = "input.txt"
+OUTPUT_XLSX  = "ParsedLogs_UPI.xlsx"
+OUTPUT_DOCX  = "ParsedLogs_UPI.docx"
 
-# 1) Header regex
-HEADER_RE = re.compile(
+# UPI regex: no word‐char immediately before/after
+UPI_REGEX = re.compile(
+    r'(?<!\w)'
+    r'([A-Za-z0-9.\-_]{2,256}@[A-Za-z]{2,64})'
+    r'(?![\w\.])'
+)
+
+# Timestamp detection (with optional ms)
+TIMESTAMP_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?\s'
+)
+
+# Header regex for Type B (and generic)
+HEADER_B_RE = re.compile(
     r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)\s+'
     r'\[(?P<thread>[^\]]+)\]\s+'
     r'\[(?P<level>\w+)\s*\]\s+'
@@ -16,48 +32,57 @@ HEADER_RE = re.compile(
     r'(?P<rest>.+)$'
 )
 
-def flatten(o, prefix=""):
+# === HELPERS ===
+def flatten_json(o, prefix=""):
     out = {}
     if isinstance(o, dict):
-        for k,v in o.items():
+        for k, v in o.items():
             key = f"{prefix}{k}"
-            if isinstance(v,(dict,list)):
-                out.update(flatten(v, key + "."))
+            if isinstance(v, (dict, list)):
+                out.update(flatten_json(v, key + "."))
             else:
                 out[key] = v
     elif isinstance(o, list):
-        for i,item in enumerate(o):
-            out.update(flatten(item, f"{prefix}[{i}]."))
+        for i, item in enumerate(o):
+            out.update(flatten_json(item, f"{prefix}[{i}]."))
     return out
 
-def parse_type_b(line):
-    m = HEADER_RE.match(line)
+def parse_type_a(line):
+    m = re.match(
+        r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+'
+        r'(?P<level>\w+)\s+\[(?P<thread>[^\]]+)\]\s+'
+        r'cid=\[(?P<cid>[^\]]*)\]\s+'
+        r'txn=\[(?P<txn>[^\]]*)\]\s+'
+        r'(?P<logger>\w+)\s*:\s*(?P<message>.+)$',
+        line
+    )
     if not m:
-        raise ValueError("Header parse failed")
-    hdr = m.groupdict()
-    rest = hdr.pop("rest")
+        raise ValueError("Type A parse error")
+    return m.groupdict()
+
+def parse_type_b(lines):
+    # lines: list of (line_no, text)
+    header_line = lines[0][1]
+    mb = HEADER_B_RE.match(header_line)
+    if not mb:
+        raise ValueError("Type B header parse failed")
+    hdr = mb.groupdict()
+    rest = hdr.pop("rest") + "\n" + "\n".join(txt for _, txt in lines[1:])
 
     segments = []
     pos = 0
-    length = len(rest)
-
     while True:
-        # find next JSON
         start = rest.find("{", pos)
         if start == -1:
-            # trailing metadata
             tail = rest[pos:].strip()
             if tail:
                 segments.append(("metadata", tail))
             break
-
-        # metadata before JSON
         if start > pos:
             meta = rest[pos:start].strip()
             if meta:
                 segments.append(("metadata", meta))
-
-        # find matching brace
+        # brace matching
         depth = 0
         end = start
         for i, ch in enumerate(rest[start:], start):
@@ -68,12 +93,10 @@ def parse_type_b(line):
                 if depth == 0:
                     end = i
                     break
-
         payload = rest[start:end+1]
         segments.append(("payload", payload))
-        pos = end+1
+        pos = end + 1
 
-    # build record
     rec = {
         "timestamp": hdr["timestamp"],
         "thread":    hdr["thread"],
@@ -81,60 +104,113 @@ def parse_type_b(line):
         "logger":    hdr["logger"],
     }
 
-    # assign metadata_i and payload_i, and flatten payloads
-    payload_count = 0
-    meta_count    = 0
-    for kind, text in segments:
+    meta_i = pay_i = 0
+    for kind, txt in segments:
         if kind == "metadata":
-            rec[f"metadata_{meta_count}"] = text
-            meta_count += 1
-        else:  # payload
-            rec[f"payload_{payload_count}"] = text
-            # flatten this JSON
+            rec[f"metadata_{meta_i}"] = txt
+            meta_i += 1
+        else:
+            rec[f"payload_{pay_i}"] = txt
             try:
-                obj = json.loads(text)
-                flat = flatten(obj)
-                for k,v in flat.items():
-                    rec[f"payload_{payload_count}.{k}"] = v
-            except:
-                rec[f"payload_{payload_count}.parse_error"] = "invalid JSON"
-            payload_count += 1
+                obj = json.loads(txt)
+                for k, v in flatten_json(obj).items():
+                    rec[f"payload_{pay_i}.{k}"] = v
+            except json.JSONDecodeError:
+                rec[f"payload_{pay_i}.parse_error"] = "invalid JSON"
+            pay_i += 1
 
     return rec
 
+# === MAIN ===
 def main():
-    records = []
+    # 1) Read & group into records
+    raw_lines = []
     with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
-        for idx, ln in enumerate(f, start=1):
-            txt = ln.strip()
-            if not txt or "~#~" not in txt:
-                continue
-            try:
-                rec = parse_type_b(txt)
-                rec["line_no"] = idx
-                records.append(rec)
-            except Exception as e:
-                print(f"Line {idx} error: {e}")
+        for ln_no, raw in enumerate(f, start=1):
+            text = raw.rstrip("\n")
+            if text.strip():
+                raw_lines.append((ln_no, text))
 
-    # write to Excel
-    wb = xlsxwriter.Workbook(OUTPUT_FILE)
-    ws = wb.add_worksheet("TypeB_Validation")
+    records = []
+    curr = None
+    for ln_no, text in raw_lines:
+        if TIMESTAMP_RE.match(text):
+            curr = {"start": ln_no, "lines": [(ln_no, text)]}
+            records.append(curr)
+        else:
+            if curr:
+                curr["lines"].append((ln_no, text))
 
-    # dynamic headers
-    headers = []
-    for r in records:
-        for h in r:
-            if h not in headers:
-                headers.append(h)
+    total_logs = len(records)
+    parsed = []
+    errors = []
 
-    for c,h in enumerate(headers):
-        ws.write(0, c, h)
-    for r,rec in enumerate(records, start=1):
-        for c,h in enumerate(headers):
-            ws.write(r, c, rec.get(h, ""))
+    # 2) Parse each record, then scan for UPI
+    for rec in tqdm(records, desc="Parsing logs"):
+        ln0 = rec["start"]
+        header = rec["lines"][0][1]
+        try:
+            if " cid=" in header and " txn=" in header:
+                data = parse_type_a(header)
+                t = "A"
+            else:
+                data = parse_type_b(rec["lines"])
+                t = "B"
+        except Exception as e:
+            errors.append({
+                "line_no": ln0,
+                "raw": "\n".join(txt for _, txt in rec["lines"]),
+                "error": str(e)
+            })
+            continue
+
+        # scan for UPI in every field
+        for field, val in data.items():
+            for m in UPI_REGEX.finditer(str(val)):
+                parsed.append({
+                    "line_no":   ln0,
+                    "type":      t,
+                    **data,
+                    "match":     m.group(1),
+                    "field":     field
+                })
+
+    # 3) Write Excel
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws1 = wb.add_worksheet("ParsedLogs")
+    if parsed:
+        headers = list(parsed[0].keys())
+        for c, h in enumerate(headers):
+            ws1.write(0, c, h)
+        red = wb.add_format({"font_color": "red"})
+        for r, row in enumerate(parsed, start=1):
+            for c, h in enumerate(headers):
+                ws1.write(r, c, row.get(h, ""), red if h == "match" else None)
+
+    ws2 = wb.add_worksheet("Errors")
+    ws2.write_row(0, 0, ["line_no", "raw", "error"])
+    for r, err in enumerate(errors, start=1):
+        ws2.write(r, 0, err["line_no"])
+        ws2.write(r, 1, err["raw"])
+        ws2.write(r, 2, err["error"])
 
     wb.close()
-    print(f"Wrote {len(records)} rows to {OUTPUT_FILE}")
+
+    # 4) Write Word
+    doc = Document()
+    for row in tqdm(parsed, desc="Generating Word"):
+        p = doc.add_paragraph()
+        p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
+        mrun = p.add_run(row["match"])
+        mrun.font.color.rgb = RGBColor(255, 0, 0)
+        p.add_run(f" [{row['field']}]")
+    doc.save(OUTPUT_DOCX)
+
+    # 5) Summary
+    print(f"Total logs         : {total_logs}")
+    print(f"Total UPI matches  : {len(parsed)}")
+    print(f"Parse errors       : {len(errors)}")
+
 
 if __name__ == "__main__":
     main()
