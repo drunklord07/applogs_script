@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+import re
+import json
+import xlsxwriter
+from tqdm import tqdm
+from docx import Document
+from docx.shared import RGBColor
+
+# === CONFIG ===
+INPUT_FILE   = "input.txt"
+OUTPUT_XLSX  = "ParsedLogs_PAN.xlsx"
+OUTPUT_DOCX  = "ParsedLogs_PAN.docx"
+
+# PAN regex: five uppercase letters, four digits, one uppercase letter
+PAN_INNER = r'[A-Z]{5}[0-9]{4}[A-Z]'
+PAN_REGEX = re.compile(rf'(?<![A-Z0-9])({PAN_INNER})(?![A-Z0-9])')
+# key=value pattern for PAN
+KV_REGEX  = re.compile(rf'\b([A-Za-z0-9_]+)\s*=\s*({PAN_INNER})\b')
+
+# Header: timestamp, thread, level, skip extras, logger
+HEADER_RE = re.compile(
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
+    r'\[(?P<thread>[^\]]+)\]\s+'
+    r'\[(?P<level>[^\]]+)\]\s+'
+    r'(?:\[[^\]]*\]\s+)*'
+    r'\[(?P<logger>[^\]]+)\]\s*-\s*'
+    r'(?P<rest>.+)$'
+)
+
+def flatten_json(o, prefix=""):
+    out = {}
+    if isinstance(o, dict):
+        for k, v in o.items():
+            p = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                out.update(flatten_json(v, p + "."))
+            else:
+                out[p] = v
+    elif isinstance(o, list):
+        for i, x in enumerate(o):
+            out.update(flatten_json(x, f"{prefix}[{i}]."))
+    return out
+
+def extract_fragments(s):
+    frags, pos = [], 0
+    while True:
+        start = s.find("{", pos)
+        if start < 0:
+            break
+        depth = 0
+        for i, ch in enumerate(s[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    frags.append(s[start:i+1])
+                    pos = i + 1
+                    break
+        else:
+            break
+    return frags
+
+def find_nearest_key(frag, idx):
+    best, bp = None, -1
+    for m in re.finditer(r'\b([A-Za-z0-9_]+)\s*=', frag):
+        eq = m.end() - 1
+        if eq < idx and eq > bp:
+            bp, best = eq, m.group(1)
+    return best
+
+def main():
+    # 1) Read nonblank lines
+    lines = []
+    with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
+        for ln_no, raw in enumerate(f, 1):
+            txt = raw.rstrip("\n")
+            if txt.strip():
+                lines.append((ln_no, txt))
+
+    parsed, errors = [], []
+
+    # 2) Process each line
+    for ln_no, line in tqdm(lines, desc="Parsing lines"):
+        m = HEADER_RE.match(line)
+        if not m:
+            errors.append({"line_no": ln_no, "raw": line, "error": "Header parse failed"})
+            continue
+        hdr  = m.groupdict()
+        rest = hdr.pop("rest")
+        seen = set()
+
+        # 3) JSON-fragment–based scanning
+        for frag in extract_fragments(rest):
+            leaves = {}
+            try:
+                leaves = flatten_json(json.loads(frag))
+            except json.JSONDecodeError:
+                pass
+
+            for mo in PAN_REGEX.finditer(frag):
+                pan = mo.group(1)
+                pos = mo.start()
+                paths = [p for p, v in leaves.items() if str(v).find(pan) != -1]
+                if paths:
+                    for fld in paths:
+                        key = (fld, pan)
+                        if key not in seen:
+                            seen.add(key)
+                            parsed.append({**hdr, "line_no": ln_no, "field": fld, "match": pan})
+                else:
+                    fld = find_nearest_key(frag, pos) or "fragment"
+                    key = (fld, pan)
+                    if key not in seen:
+                        seen.add(key)
+                        parsed.append({**hdr, "line_no": ln_no, "field": fld, "match": pan})
+
+        # 4) key=value scan across entire rest
+        for km in KV_REGEX.finditer(rest):
+            fld, pan = km.group(1), km.group(2)
+            key = (fld, pan)
+            if key not in seen:
+                seen.add(key)
+                parsed.append({**hdr, "line_no": ln_no, "field": fld, "match": pan})
+
+    # 5) Write Excel
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws1 = wb.add_worksheet("ParsedLogs")
+    if parsed:
+        cols = list(parsed[0].keys())
+        for c, h in enumerate(cols):
+            ws1.write(0, c, h)
+        red = wb.add_format({"font_color": "red"})
+        for r, row in enumerate(parsed, 1):
+            for c, h in enumerate(cols):
+                ws1.write(r, c, row[h], red if h == "match" else None)
+    ws2 = wb.add_worksheet("Errors")
+    ws2.write_row(0, 0, ["line_no", "raw", "error"])
+    for r, e in enumerate(errors, 1):
+        ws2.write(r, 0, e["line_no"])
+        ws2.write(r, 1, e["raw"])
+        ws2.write(r, 2, e["error"])
+    wb.close()
+
+    # 6) Write Word
+    doc = Document()
+    for row in tqdm(parsed, desc="Generating Word"):
+        p = doc.add_paragraph()
+        p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
+        run = p.add_run(row["match"])
+        run.font.color.rgb = RGBColor(255, 0, 0)
+        p.add_run(f" [{row['field']}]")
+    doc.save(OUTPUT_DOCX)
+
+    # 7) Summary
+    print(f"Total lines           : {len(lines)}")
+    print(f"Total PAN matches     : {len(parsed)}")
+    print(f"Header parse failures : {len(errors)}")
+
+if __name__ == "__main__":
+    main()
