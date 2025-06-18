@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+import re
+import json
+import xlsxwriter
+from tqdm import tqdm
+from docx import Document
+from docx.shared import RGBColor
+
+# === CONFIG ===
+INPUT_FILE     = "input.txt"
+OUTPUT_XLSX    = "ParsedLogs_Customer.xlsx"
+OUTPUT_DOCX    = "ParsedLogs_Customer.docx"
+
+# Customer‐related keywords (case-insensitive)
+CUSTOMER_KEYS = [
+    "customer id", "cust id", "customerid", "custid",
+    "customer number", "cust number", "customer no", "cust no",
+    "customeridnumber", "custidnumber"
+]
+# Normalize for JSON key lookup
+NORMALIZED_KEYS = {re.sub(r'[^a-z0-9]', '', k.lower()): k for k in CUSTOMER_KEYS}
+
+# Build key=value regex, longest first
+_kw_alt = "|".join(re.escape(k) for k in sorted(CUSTOMER_KEYS, key=lambda x: -len(x)))
+KV_REGEX = re.compile(rf'(?i)\b(?:{_kw_alt})\b\s*(?:[:=])\s*("?)([^",\]\r\n]+)\1')
+
+# Header: timestamp, thread, level, skip extras, logger, then rest
+HEADER_RE = re.compile(
+    r'^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d+)?)\s+'
+    r'\[(?P<thread>[^\]]+)\]\s+'
+    r'\[(?P<level>[^\]]+)\]\s+'
+    r'(?:\[[^\]]*\]\s+)*'
+    r'\[(?P<logger>[^\]]+)\]\s*-\s*'
+    r'(?P<rest>.+)$'
+)
+
+def flatten_json(o, prefix=""):
+    out = {}
+    if isinstance(o, dict):
+        for k, v in o.items():
+            p = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                out.update(flatten_json(v, p + "."))
+            else:
+                out[p] = v
+    elif isinstance(o, list):
+        for i, x in enumerate(o):
+            out.update(flatten_json(x, f"{prefix}[{i}]."))
+    return out
+
+def extract_fragments(s):
+    frags, pos = [], 0
+    while True:
+        start = s.find("{", pos)
+        if start < 0:
+            break
+        depth = 0
+        for i, ch in enumerate(s[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    frags.append(s[start:i+1])
+                    pos = i + 1
+                    break
+        else:
+            break
+    return frags
+
+def find_nearest_key(frag, idx):
+    best, bp = None, -1
+    for m in re.finditer(r'\b([A-Za-z0-9_]+)\s*=', frag):
+        eq = m.end() - 1
+        if eq < idx and eq > bp:
+            bp, best = eq, m.group(1)
+    return best
+
+def main():
+    # Read nonblank lines
+    lines = []
+    with open(INPUT_FILE, encoding="utf-8", errors="ignore") as f:
+        for ln_no, raw in enumerate(f, 1):
+            txt = raw.rstrip("\n")
+            if txt.strip():
+                lines.append((ln_no, txt))
+
+    parsed, errors = [], []
+
+    for ln_no, line in tqdm(lines, desc="Parsing lines"):
+        m = HEADER_RE.match(line)
+        if not m:
+            errors.append({"line_no": ln_no, "raw": line, "error": "Header parse failed"})
+            continue
+        hdr  = m.groupdict()
+        rest = hdr.pop("rest")
+        seen = set()
+
+        # 1) Scan inside JSON fragments
+        for frag in extract_fragments(rest):
+            leaves = {}
+            try:
+                leaves = flatten_json(json.loads(frag))
+            except json.JSONDecodeError:
+                leaves = {}
+            for path, val in leaves.items():
+                leaf_key = re.sub(r'[^a-z0-9]', '', path.split('.')[-1].lower())
+                if leaf_key in NORMALIZED_KEYS:
+                    key = (path, str(val))
+                    if key not in seen:
+                        seen.add(key)
+                        parsed.append({**hdr, "line_no": ln_no, "field": path, "match": val})
+
+        # 2) Fallback key=value scan in raw text
+        for km in KV_REGEX.finditer(rest):
+            fld   = km.group(0).split(km.group(2), 1)[0].rstrip(' :=').strip()
+            value = km.group(2).strip()
+            key   = (fld, value)
+            if key not in seen:
+                seen.add(key)
+                parsed.append({**hdr, "line_no": ln_no, "field": fld, "match": value})
+
+    # Write Excel
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws1 = wb.add_worksheet("ParsedLogs")
+    if parsed:
+        cols = list(parsed[0].keys())
+        for c, h in enumerate(cols):
+            ws1.write(0, c, h)
+        red = wb.add_format({"font_color": "red"})
+        for r, row in enumerate(parsed, 1):
+            for c, h in enumerate(cols):
+                ws1.write(r, c, row[h], red if h == "match" else None)
+    ws2 = wb.add_worksheet("Errors")
+    ws2.write_row(0, 0, ["line_no", "raw", "error"])
+    for r, e in enumerate(errors, 1):
+        ws2.write(r, 0, e["line_no"])
+        ws2.write(r, 1, e["raw"])
+        ws2.write(r, 2, e["error"])
+    wb.close()
+
+    # Write Word
+    doc = Document()
+    for row in tqdm(parsed, desc="Generating Word"):
+        p = doc.add_paragraph()
+        p.add_run(f"{row['line_no']} | {row['timestamp']} | ")
+        run = p.add_run(str(row["match"]))
+        run.font.color.rgb = RGBColor(255, 0, 0)
+        p.add_run(f" [{row['field']}]")
+    doc.save(OUTPUT_DOCX)
+
+    # Summary
+    print(f"Total lines            : {len(lines)}")
+    print(f"Total customer matches : {len(parsed)}")
+    print(f"Header parse failures  : {len(errors)}")
+
+if __name__ == "__main__":
+    main()
